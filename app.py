@@ -17,6 +17,11 @@ def get_most_congested_areas():
     top_congested_areas = congestion_by_borough.head(3).to_dict()
     return top_congested_areas
 
+def get_most_congested_areas_2():
+    congestion_by_borough = data.groupby('Boro')['Vol'].sum().sort_values(ascending=False)
+    top_congested_areas = congestion_by_borough.head(3).to_dict()
+    return top_congested_areas
+
 # Helper function to get daily average traffic volume per borough
 def get_average_traffic_per_borough():
     daily_avg_traffic = data.groupby('Boro')['Vol'].mean().to_dict()
