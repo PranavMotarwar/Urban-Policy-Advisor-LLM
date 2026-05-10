@@ -172,7 +172,7 @@ sequenceDiagram
     API->>Svc: UserTranscriptStarted(u1)
     Note over Svc: state = pending<br/>(Layer 1 armed)
     API->>Svc: AudioEvent(a1, ...)
-    Note over Svc: queued; track a1 in pending_items
+    Note over Svc: queued track a1 in pending_items
     API->>Svc: UserTranscriptDelta(u1, "how is SeaWorld")
     Note over Svc: Layer 1 fires<br/>contains_seaworld → trigger!
     Svc->>API: cancel_response()
