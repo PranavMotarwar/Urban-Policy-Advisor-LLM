@@ -1345,6 +1345,984 @@ A: I'd pick **task completion rate**, because it's the headline business outcome
 
 ---
 
+## Case Study 4: AI Coding Assistant (Copilot-style)
+
+### The scenario
+
+> "Design an AI coding assistant for a 2,000-engineer company. Engineers work in a monorepo of 8 million lines across 12 languages. The assistant should suggest code completions in-IDE, answer questions about the codebase, and help draft small PRs."
+
+### Why this is a distinct archetype
+
+Code is structured text with semantics. Retrieval is over code units (functions, classes, files), not paragraphs. Latency budget is brutal — sub-200ms for inline completions. Quality bar is high (compiling code, not approximations). Output is verifiable (it either parses or it doesn't).
+
+### Step 1: Clarifying questions
+
+- **Three modes or one?** Inline complete vs. chat-style Q&A vs. PR drafting are very different latency and quality profiles. Often three different products under one brand.
+- **Privacy posture?** Does the code leave the company perimeter? On-prem self-host vs. private cloud vs. provider API changes everything.
+- **Languages and frameworks?** Polyglot or mostly Python+Go? Indexing strategy and model choice depend on this.
+- **What "right" means.** Edit-acceptance rate? Compile rate? Time saved per task?
+
+### v1: Baseline — provider-API copilot
+
+```mermaid
+flowchart LR
+    IDE([IDE plugin]) --> Edge[Edge gateway<br/>auth + rate limit]
+    Edge --> Ctx[Context Builder<br/>last 20 lines + filename]
+    Ctx --> LLM[Code LLM<br/>provider API]
+    LLM --> Filter[Output filter<br/>strip comments, dedupe]
+    Filter --> IDE
+
+    subgraph Telem[Telemetry]
+        Accept[Acceptance tracker]
+        Lat[Latency metrics]
+    end
+    IDE -.-> Accept
+    LLM -.-> Lat
+```
+
+**v1 in words:** IDE plugin sends the current file's last 20-50 lines and filename. LLM returns a completion. Plugin shows ghost text. User accepts (Tab) or rejects.
+
+### v1 failure modes
+
+1. **No repo awareness.** Can't reference a function defined three files away. ~40% of useful suggestions need cross-file context.
+2. **Latency tail.** Provider P99 of 1.5s makes Tab-complete feel laggy. Anything > 300ms users start ignoring.
+3. **Hallucinated APIs.** Calls `requests.fetch()` because the model knew it from JS. Embarrassing.
+4. **Privacy mismatch.** Engineers complain code leaves the building.
+
+### v2: Repo-aware retrieval + small fast model + speculative
+
+```mermaid
+flowchart TB
+    IDE[IDE plugin] --> Edge[Edge gateway]
+    Edge --> Intent{Intent}
+    Intent -->|inline complete| Fast[Fast path<br/>small code LLM<br/>self-hosted vLLM]
+    Intent -->|chat or PR draft| Slow[Quality path<br/>big code LLM]
+
+    subgraph FastPath[Fast Path]
+        Fast --> CtxLocal[Local file context<br/>+ open buffers]
+        Fast --> RepoIdx[(Repo Embedding Index<br/>per-function)]
+        Fast --> ASTCtx[Tree-sitter AST context<br/>imports, types in scope]
+    end
+
+    subgraph SlowPath[Slow Path]
+        Slow --> Plan[Plan agent]
+        Slow --> RepoIdx2[(Same repo index)]
+        Slow --> Test[Run-tests sandbox]
+        Slow --> Compile[Compile sandbox]
+    end
+
+    Fast --> SpecDec[Speculative decoding<br/>draft 1B → verify 8B]
+    SpecDec --> Filter[Output: parse check]
+    Filter --> IDE
+
+    subgraph Ingest[Code ingestion]
+        Repo[(Git repo)] --> Walker[AST walker tree-sitter]
+        Walker --> Chunker[Function-level chunks]
+        Chunker --> EmbedC[Code embedding model]
+        EmbedC --> RepoIdx
+    end
+
+    subgraph Eval[Eval pipeline]
+        ETC[Edit-Trial Compilation]
+        EAR[Edit-Acceptance Rate]
+        SWE[SWE-bench style tests]
+    end
+```
+
+**Key design moves:**
+- **Two-speed product.** Inline completion runs a small fast model (1-3B class) self-hosted with speculative decoding; PR drafting / chat runs a big model. Same brand, two backends.
+- **AST-aware chunking.** Tree-sitter parses every file into function/class units. Each unit becomes a chunk. Imports and type signatures are stored as separate "context cards" you can inject cheaply.
+- **Type-in-scope retrieval.** When completing inside `foo()`, your context includes the type signatures of every symbol currently in scope — not just embedded retrieval but a deterministic AST query.
+- **Parse-check guardrail.** Reject any completion that doesn't parse. Cheap, catches the "hallucinated API" class.
+
+### v3: On-prem + per-team fine-tunes + PR-author agent
+
+- **On-prem.** Self-host the 8B model on internal GPUs; code never leaves. Use Anthropic / OpenAI only for the chat/PR-draft modes with explicit redaction.
+- **Per-team fine-tunes.** Each team's PRs become training data; LoRA adapters per team capture codebase idioms. Adapter swap at inference time keeps the cost down.
+- **PR-author agent.** For larger tasks (file new function, add test, update docs), a multi-step agent: plan → write → compile → run test → critique → submit PR. Uses your Case 2 agent pattern.
+
+### Cost math
+
+Assumptions: 2,000 engineers × 200 inline completions/day × 250 working days = 100M inline calls/year. Plus 10 chat calls/eng/day = 5M chat calls/year.
+
+- **Inline (self-host 8B on 2× H100, $4K/mo amortized):** ~$50K/year hardware. At 100M calls / 8K req/sec × seconds/year ≈ utilized well. Effective: ~$0.0005/call.
+- **Chat (Claude 4.5 / GPT class):** ~$0.03/call × 5M = $150K/year.
+- **Index ingestion:** 8M LOC, ~800K functions, embed once + delta updates. ~$5K/year.
+- **Total ~$210K/year for 2K engineers = $105/eng/year.** Compare to GitHub Copilot Enterprise at ~$240/eng/year — your homegrown beats it on cost *and* keeps code on-prem.
+
+### Latency math
+
+| Phase | Target ms | Reality |
+|---|---|---|
+| Network out → edge | 10 | OK |
+| Auth + rate limit | 5 | OK |
+| Context build (AST + embed) | 30 | Pre-cached for active buffer |
+| Vector lookup | 20 | HNSW small index |
+| LLM prefill (small model, 2K ctx) | 80 | OK with speculative |
+| LLM decode (50 tok output) | 100 | Speculative cuts this from 200 |
+| Parse check | 5 | Tree-sitter is fast |
+| Total TTFT | **~250ms** | Acceptable for inline |
+
+### Eval strategy
+
+- **Offline:** SWE-bench Lite for PR-style tasks; HumanEval/MBPP for function gen; internal "edit-trial-compilation" benchmark on real historical PRs (does the model's completion match what was actually committed?).
+- **Online:** edit-acceptance rate (Tab vs. Escape). The headline metric. Healthy is 25-35%.
+- **Quality floor:** completions that don't parse → reject. Zero tolerance.
+- **Per-language:** track acceptance by language; weak languages get targeted prompt or fine-tune work.
+
+### Curveball Q&A for Case 4
+
+**Q: How do you avoid leaking secrets through completions?**
+
+A: Two layers. (1) At ingestion: redact secrets from indexed code using regex + entropy detection; never embed a `.env`. (2) At inference: scan completions for secret-shaped strings before showing. Plus: indexed corpus excludes anything in `.gitignore`. The engineer-facing path is never the place to learn secret hygiene.
+
+**Q: What if the model suggests vulnerable code?**
+
+A: Layer in a security linter (Semgrep, CodeQL rules) as a post-output guardrail. Completion fails the security check → silent reject (not "blocked" — that disrupts flow). Track suppression rate as a metric. Periodically run red-team prompts ("write a SQL handler") to verify the linter is catching real cases.
+
+**Q: How do you handle the cold-start problem for a new repo?**
+
+A: First-pass embed everything. While that runs, the assistant works in "no-repo-context" mode (worse but functional). For very new repos, lean harder on the AST-aware context (imports, type signatures) which works without embeddings. Acceptance rate dips for the first 24 hours; back to baseline by day 2.
+
+**Q: How do you measure "quality" without ground truth?**
+
+A: Acceptance is the proxy. Plus: 24-hour edit-survival rate (was the completion still there a day later, unmodified?). Plus: compile rate on the resulting file. Plus: quarterly user satisfaction surveys. No one of these is sufficient; the panel of three is the practical signal.
+
+**Q: When would you NOT use this and just keep GitHub Copilot?**
+
+A: When engineering org < 200 and security posture allows code to leave. The on-prem advantage matters most at scale and in regulated industries; below that, Copilot/Cursor is cheaper to operate and the cost premium is marginal vs. an engineer's time to build this system.
+
+---
+
+## Case Study 5: Document Intelligence (Invoice / Contract Extraction)
+
+### The scenario
+
+> "Design a system that processes 50K invoices/day across 40 languages from a global enterprise's AP automation flow. The system reads each invoice (PDF or image), extracts ~30 structured fields (vendor, line items, tax, totals, PO match, etc.), and pushes to the ERP. Errors cost money and audit findings."
+
+### Why this is a distinct archetype
+
+This is **vision-heavy structured extraction**, not chat. The output is JSON, not prose. Latency is asynchronous (batch). The eval is *exact match* on fields, not LLM-as-judge. Hallucinations are expensive — a wrong amount field debits the wrong account.
+
+### Step 1: Clarifying questions
+
+- **Field criticality?** Some fields (vendor name, total) must be 99.5%+ accurate; line items can tolerate 95%. Drives architecture tier.
+- **Document quality?** Scanned PDFs vs. native PDFs vs. photos? Drives OCR strategy.
+- **PO match required?** Does the system also reconcile against POs? Becomes a retrieval + matching problem on top.
+- **Throughput?** 50K/day = ~1/sec average; 5/sec peak. Batchable.
+- **Human-in-loop policy?** Auto-approve if confidence > X; queue for human otherwise.
+
+### v1: Naive — vision-LLM end-to-end
+
+```mermaid
+flowchart LR
+    Inbox([Email / S3 inbox]) --> Q[(Job Queue)]
+    Q --> Worker[Worker]
+    Worker --> Vision[Vision LLM<br/>document → JSON]
+    Vision --> Validate[Schema validate]
+    Validate -->|valid| ERP[ERP API]
+    Validate -->|invalid| HQ[Human Queue]
+```
+
+**v1 in words:** PDF / image → vision model → JSON. Validate. Send.
+
+### v1 failure modes
+
+1. **Layout drift.** Vendor A's invoice changes layout next quarter; model accuracy drops silently.
+2. **Numerical errors.** Vision LLMs are bad at multi-row tables. Totals don't match line items.
+3. **Long tail of vendors.** 10,000 vendors with different invoice templates; model is mediocre across all.
+4. **Cost explodes.** Each invoice = 2,500 input tokens (image) + 1,000 output (JSON). 50K/day × $0.01 = $500/day = $180K/year just on LLM.
+5. **Hallucinated fields.** Model fills `VAT_number` when not present.
+6. **Tax math wrong.** LLMs compute arithmetic poorly. `subtotal + tax != total` happens.
+
+### v2: Stage pipeline — OCR + classifier + extractor + verifier
+
+```mermaid
+flowchart TB
+    PDF[Incoming PDF/IMG] --> Q[(Queue)]
+    Q --> OCR[OCR + Layout<br/>Azure DI or PaddleOCR]
+    OCR --> Class[Doc Type Classifier<br/>invoice vs receipt vs contract]
+    Class -->|invoice| Layout[Layout-aware extractor]
+    Class -->|other| Reject[Route or reject]
+
+    Layout --> Tmpl{Known<br/>vendor template?}
+    Tmpl -->|yes| TmplEx[Template-rule extractor<br/>regex on positions]
+    Tmpl -->|no| LLM[Vision LLM extractor<br/>JSON-mode strict]
+
+    TmplEx --> Merge[Merge fields]
+    LLM --> Merge
+    Merge --> Verify[Verifier<br/>1: schema strict<br/>2: arithmetic check<br/>3: PO match]
+    Verify --> Conf{Confidence}
+    Conf -->|high| ERP[ERP API]
+    Conf -->|low| HQ[Human Queue]
+
+    HQ --> Annotator[Annotator UI]
+    Annotator --> Audit[(Audit log)]
+    Annotator -.-> Train[(Training data for next fine-tune)]
+```
+
+**Key design moves:**
+- **OCR before LLM.** Azure Document Intelligence or PaddleOCR gives you tokens + bounding boxes. Pass *text + layout coordinates* to the LLM, not raw image. Cuts tokens 5×, improves table reading.
+- **Doc-type classifier.** Small model (logistic regression or DistilBERT) routes to the right extractor. Don't waste vision-LLM tokens on a receipt that doesn't match the invoice schema.
+- **Per-vendor templates.** Top 100 vendors = 60% of volume. Build deterministic extractors for them: faster, cheaper, more accurate. LLM is the fallback for the long tail.
+- **Arithmetic verifier.** After extraction, run `subtotal + tax == total` and `sum(line_items) == subtotal`. If violated, mark low confidence. This is the single highest-value verifier.
+- **Confidence as routing primitive.** Per-field confidence scores → policy table → auto-approve or human-queue.
+
+### v3: Active learning + per-tenant + audit
+
+- **Active learning loop.** Human-corrected fields flow back into training data. Monthly fine-tune of the LLM extractor on accumulated corrections. After 6 months, long-tail accuracy climbs from 85% → 95%.
+- **Per-tenant data isolation.** Each customer's templates and corrections in tenant-scoped storage; no cross-tenant model leakage. Per-tenant LoRA adapter if data volume justifies.
+- **Audit-grade logging.** Every field decision has provenance: which extractor produced it, confidence, who reviewed if any. Required for SOX/financial audit.
+
+### Cost math
+
+- **OCR (Azure DI):** $1.50 / 1K pages. 50K/day × 365 = 18M pages / yr → **$27K/year**.
+- **Classifier:** self-hosted DistilBERT, negligible.
+- **Template extractor:** zero LLM cost; just compute.
+- **LLM extractor (fallback, 40% of volume after templates dominate):** 50K/day × 0.4 × $0.005 = $100/day → **$36K/year**.
+- **Human review (15% of volume × $1.50/doc reviewer cost):** ~**$40K/year**.
+- **Total: ~$103K/year** to process 18M docs. **~$0.006 / doc**.
+
+Compare: human-only AP processing at $5-15/invoice → millions per year. Automation pays back in weeks.
+
+### Latency math
+
+Async-batch is fine. End-to-end SLA: 5 minutes for 95% of invoices. P99: 1 hour (gives human queue room).
+
+| Phase | Time |
+|---|---|
+| OCR | 2-5 s |
+| Classify | < 100 ms |
+| Template path | < 200 ms |
+| LLM path | 3-8 s |
+| Verify | < 500 ms |
+| Total auto-path | 5-15 s |
+
+### Eval strategy
+
+- **Field-level F1.** Per-field exact-match accuracy on a labeled set of 2,000 invoices.
+- **Arithmetic check pass rate.** % of invoices where math validates without human intervention.
+- **Auto-approval rate.** % of invoices that go through end-to-end without humans. Target: 75-85%.
+- **False-approve rate.** Wrong fields that *passed* auto-approve. Must be < 0.5% on critical fields.
+- **Per-vendor regression detection.** Weekly accuracy by vendor — catches template drift.
+
+### Curveball Q&A for Case 5
+
+**Q: A vendor changes their invoice layout. How quickly do you detect and recover?**
+
+A: Detection: per-vendor weekly accuracy dashboard with anomaly bands. A drop > 5pp on a high-volume vendor triggers an alert. Recovery: route that vendor to the LLM fallback path (template disabled). Operator reviews ~50 fresh invoices in the annotation UI; new template gets generated (semi-automatically from the corrected examples). Round-trip is typically 24-48 hours.
+
+**Q: What if a vendor sends 10,000 invoices in a burst?**
+
+A: The queue absorbs it; workers scale horizontally on queue depth. SLA may extend from 5 min to 30 min, but no data loss. Per-tenant rate limit prevents one tenant from starving others. The human queue gets prioritized FIFO with tenant-fair scheduling.
+
+**Q: How do you handle multilingual invoices?**
+
+A: OCR is multilingual natively. LLM extraction needs a language-aware prompt; classifier output includes detected language; per-language prompt template. For low-resource languages, lean harder on templates (less LLM dependency).
+
+**Q: Why not skip OCR and just use the vision LLM end-to-end?**
+
+A: Three reasons. (1) Token cost: a 300dpi PDF page is ~2,500 image tokens; OCR'd text + layout is ~500 tokens. 5× cost savings. (2) Table accuracy: dedicated OCR + structure tools (Azure DI, Unstructured) extract tables with explicit row/col coordinates that LLMs read perfectly. End-to-end vision is mediocre on tables. (3) Auditability: OCR output is debuggable; vision-only is a black box. The tradeoff is one extra dependency, which is worth it.
+
+**Q: Where do you store the documents themselves?**
+
+A: S3 with object-lock for compliance retention; lifecycle policy moves to Glacier after 90 days; deletion only via audit-logged path. Documents are encrypted with per-tenant KMS keys.
+
+---
+
+## Case Study 6: Meeting Summarizer + Action Items
+
+### The scenario
+
+> "Design a Zoom/Teams plugin for a 50K-employee company. After each meeting, the system delivers a summary, key decisions, and action items assigned to specific people. It needs to integrate with the company's task tracker (Asana / Jira)."
+
+### Why this is a distinct archetype
+
+Async batch with audio input. Output is structured (summary + JSON action items). Speaker attribution matters. Calendar / task integrations are write-back side-effects. Quality is judged hours later by humans editing the output.
+
+### Step 1: Clarifying questions
+
+- **Live or post-meeting?** Live (during call) is a totally different latency profile.
+- **Speaker identification?** Need speaker diarization for attribution.
+- **Privacy.** Consent for recording; per-meeting opt-in.
+- **Integrations.** What task systems? Asana, Jira, Linear, Notion all have different APIs.
+- **Output language(s)?** Summaries in original or translated to org language?
+
+### v1: Sequential — STT → LLM → write-back
+
+```mermaid
+flowchart LR
+    Meeting([Meeting ends]) --> Webhook[Webhook<br/>from Zoom / Teams]
+    Webhook --> Audio[(Audio file)]
+    Audio --> STT[STT - Whisper or Deepgram]
+    STT --> Transcript[(Transcript w/ timestamps)]
+    Transcript --> LLM[LLM<br/>summarize + extract actions]
+    LLM --> Validate[Schema validate]
+    Validate --> Distrib[Distribute]
+    Distrib --> Mail[Email recap]
+    Distrib --> Task[Task tracker API]
+    Distrib --> Cal[Calendar event update]
+```
+
+### v1 failure modes
+
+1. **Long meetings blow context.** A 90-minute meeting at 150 wpm = 13.5K words ≈ 18K tokens. Tight but OK. 3-hour planning offsite = 36K tokens → context overflow on smaller models.
+2. **No speaker attribution.** "Someone agreed to do X" — who?
+3. **Hallucinated action items.** LLM invents actions that nobody said.
+4. **Wrong action assignee.** "John will do it" — which John? Mapping names to user IDs is hard.
+5. **Privacy.** Recording an HR conversation that was opted out.
+
+### v2: Diarized + chunked + verified
+
+```mermaid
+flowchart TB
+    Audio[Audio file] --> Consent{Consent check<br/>per participant}
+    Consent -->|deny| Drop[Discard]
+    Consent -->|allow| STT[Streaming STT<br/>with diarization]
+
+    STT --> Trans[(Transcript<br/>speaker, time, text)]
+    Trans --> Chunk[Chunk by topic<br/>30-min windows w/ overlap]
+    Chunk --> Map[Map: per-chunk summary]
+    Map --> Reduce[Reduce: stitched summary<br/>+ action extractor]
+
+    Reduce --> Verify1[Verify: every action cites a transcript span]
+    Verify1 --> Resolve[Resolve assignees<br/>name → user_id via directory]
+    Resolve -->|unresolved| Ambig[Mark ambiguous<br/>queue to organizer]
+    Resolve --> Confirm[Confirm with organizer<br/>before write-back]
+
+    Confirm --> Email[Email recap to attendees]
+    Confirm --> Task[Create tasks]
+    Confirm --> Audit[(Audit log)]
+```
+
+**Key design moves:**
+- **Diarization at STT layer.** Deepgram / Whisper-X provide speaker labels. Map speaker IDs to attendees via meeting participant list.
+- **Map-reduce chunking.** Chunk transcript by 20-30 min windows with 5-min overlap. Per-chunk summary first, then a "reduce" pass that stitches and de-duplicates.
+- **Citation-verified actions.** Each action item must point to a transcript span. Reject hallucinations.
+- **Name resolution.** Directory lookup (LDAP / Workday) maps "John" → user. Ambiguous names → organizer confirms.
+- **Organizer confirmation.** Don't auto-write tasks until the organizer (sender of recap) confirms. Trust ladder: auto-email recap, manual-confirm write-back.
+
+### v3: Live mode + multilingual + per-team customization
+
+- **Live transcription side-panel.** Stream STT into a panel during the meeting. End-of-meeting summary is mostly done by hangup.
+- **Multilingual.** Detect language; summarize in meeting language; offer translation to org language.
+- **Per-team templates.** Engineering meeting → has "Decisions / Action Items / Open Questions" sections; sales call → has "Customer asks / Objections / Next steps." Templates surface via meeting calendar metadata.
+
+### Cost math
+
+50K employees × 4 meetings/day × 30 min avg × 250 working days = 50M meeting-minutes/year.
+
+- **STT (Deepgram nova-2 streaming):** $0.0043/min → $215K/year.
+- **LLM summarization (gpt-4o-mini, ~5K input + 1K output / meeting):** 50K eng × 4 meetings/day × 250 days × $0.005 = **$250K/year**.
+- **Vector index / storage:** ~$15K/year.
+- **Integrations / write-back / hosting:** ~$50K/year.
+- **Total ~$530K/year for 50K employees ≈ $10.60/eng/year.** Compare with Otter.ai Enterprise (~$30-50/eng/yr); homegrown wins on price *and* lets you integrate deeply.
+
+### Latency math
+
+Post-meeting target: recap email within 5 minutes of meeting end.
+
+| Phase | Time (60-min meeting) |
+|---|---|
+| STT batch | 15-30s if streaming was on; 2-3 min if from scratch |
+| Chunk + map summarize | 30-60s parallel |
+| Reduce | 20-40s |
+| Verify + resolve assignees | 10-20s |
+| Write-back | 5-10s |
+| **Total** | **~3 minutes** |
+
+### Eval strategy
+
+- **Action-item precision.** % of extracted actions that are *real* (per the meeting host). Target > 90%.
+- **Action-item recall.** % of real actions that were captured. Target > 85%.
+- **Assignee accuracy.** % of correctly attributed actions.
+- **Summary coherence (LLM judge).** Rolling LLM-as-judge on samples.
+- **Edit distance metric.** Track how much organizers edit before sending. Falling edit rate = improving quality.
+
+### Curveball Q&A for Case 6
+
+**Q: What about confidential meetings (HR, M&A, legal)?**
+
+A: Calendar-based or organizer-flag opt-out. Meetings marked confidential never get processed — STT job is suppressed at intake. Audit logs of suppressed meetings (without content) for compliance. For HR specifically: bot-detection bypass (the recording bot doesn't join confidential meetings; calendar metadata controls).
+
+**Q: How do you handle people speaking over each other?**
+
+A: Diarization tools handle most of it; cross-talk shows as overlapping speaker labels. For consequential moments (vote, decision), prompt the LLM with "in cases of cross-talk, flag uncertainty rather than guess." Track diarization-confidence per segment; low-confidence segments are flagged for organizer review.
+
+**Q: What if the summary is wrong and triggers a wrong action in Jira?**
+
+A: That's why the v2 design requires organizer confirmation before write-back. The recap email shows proposed tasks with edit buttons. Until organizer hits "Confirm and Create," nothing hits Jira. Trust ladder: read-mode default, write-mode opt-in.
+
+**Q: How do you make this work for non-English meetings?**
+
+A: Whisper handles 90+ languages natively. Pipeline is language-agnostic at the LLM layer if you use a multilingual model. For low-resource languages, fall back to translate-then-summarize (English LLM).
+
+**Q: What's the cheapest version that's still useful?**
+
+A: Strip features, keep diarization + summary, no action-item extraction. STT cost dominates (~$220K) but you can downgrade to Whisper self-hosted on a small GPU pool (~$30K/year for the same volume). LLM cost halves (no separate action extraction). Total ~$200K/year, half the v2 cost, ~70% of the value.
+
+---
+
+## Case Study 7: Sales Research / Account Briefing Agent
+
+### The scenario
+
+> "Design an agent that helps a B2B sales team prepare for customer meetings. Given a target company and the meeting's attendees, the agent produces a briefing: recent company news, financial signals, current tech stack, mutual connections, and likely buying triggers. Integrates with Salesforce."
+
+### Why this is a distinct archetype
+
+Web-research-heavy with multiple data sources. Output is structured + narrative. Quality is freshness + factuality. Side-effect is write-back to CRM. Used 100s of times per week per rep, but each report is bespoke.
+
+### Step 1: Clarifying questions
+
+- **Data sources?** Public web + LinkedIn + paid data (Crunchbase, ZoomInfo) + Salesforce internal? Each has different API constraints.
+- **Freshness window?** A week-old report is useless for "did they just announce earnings?"
+- **Confidentiality.** Search queries can leak intent — competitors monitoring search-side data.
+- **Hallucination tolerance.** Sales accepts some narrative looseness; financial numbers must be cited.
+
+### v1: Single-shot web search + LLM summarize
+
+```mermaid
+flowchart LR
+    Rep([Rep enters company name]) --> Search[Web search API]
+    Search --> Scrape[Scrape top 10 pages]
+    Scrape --> LLM[LLM<br/>summarize]
+    LLM --> Brief[Briefing]
+    Brief --> SF[Salesforce note]
+```
+
+### v1 failure modes
+
+1. **Search bias.** Top 10 search results are mostly press releases — over-rotates on optimistic narratives.
+2. **No internal context.** Rep loses what they had in Salesforce (past calls, contacts).
+3. **Stale data.** Wikipedia revenue figures from 2022.
+4. **Hallucinated mutual connections.** Made up LinkedIn names.
+5. **No traceability.** Numbers without source citations.
+
+### v2: Multi-source agent with citation enforcement
+
+```mermaid
+flowchart TB
+    Req([Rep request: ACME Corp meeting Tue]) --> Planner[Planner LLM]
+    Planner --> Sub[Sub-task list]
+
+    Sub --> Web[Web search subagent]
+    Sub --> News[News API subagent]
+    Sub --> Crunch[Crunchbase API]
+    Sub --> LI[LinkedIn API<br/>attendee lookup]
+    Sub --> SF[Salesforce subagent<br/>past notes, contacts]
+    Sub --> Earnings[SEC EDGAR<br/>if public]
+
+    Web --> Rank1[Rank + dedupe sources]
+    News --> Rank1
+    Crunch --> Rank1
+    LI --> Rank1
+    SF --> Rank1
+    Earnings --> Rank1
+
+    Rank1 --> Writer[Writer LLM<br/>strict citation mode]
+    Writer --> Verify[Citation verifier<br/>every claim → source]
+    Verify -->|fail| Rewrite[Rewrite missing parts]
+    Verify -->|ok| Format[Format brief<br/>with hyperlinks]
+    Format --> SF2[Push to SF as note]
+    Format --> Email[Email to rep]
+```
+
+**Key design moves:**
+- **Planner-executor with specialized sub-agents.** Each source has its own sub-agent with bounded tool surface. Run in parallel.
+- **Source ranking + dedup.** Multiple sources may say the same thing. Source authority weighting + content-hash dedup.
+- **Strict citation mode.** Every claim in the brief carries a `[source #N]` tag. Writer LLM is prompted with a system instruction that uncited claims will be rejected.
+- **Citation verifier.** Programmatic check: for each claim, does the linked source actually contain that fact (LLM-as-judge sub-check)?
+- **Recency weighting.** Newer sources beat older. Time-decay function on rank.
+
+### v3: Continuous monitoring + per-rep personalization + signal triggers
+
+- **Watchlist.** Reps subscribe to account; brief auto-refreshes weekly + on signals (earnings, exec change, funding round, big hire).
+- **Per-rep personalization.** Style preferences learned from rep edits to past briefs.
+- **Trigger-based push.** "ACME just hired a new CTO who came from your prior customer X" → push notification.
+- **Per-tenant isolation.** Strict per-tenant data isolation since briefs may leak competitive intel.
+
+### Cost math
+
+500 reps × 30 briefs/week × 50 weeks = 750K briefs/year.
+
+- **Web search API (Brave / SerpAPI):** ~$0.002/query, ~10 queries/brief → 7.5M queries × $0.002 = **$15K/year**.
+- **Paid data APIs (Crunchbase, ZoomInfo):** seat-based, ~$50K/year for 500 reps.
+- **LLM cost (multi-source agent, ~15K tokens in / 2K out, gpt-4o-mini for planner + writer, gpt-4o for tricky reduce):** ~$0.04/brief × 750K = **$30K/year**.
+- **Hosting + integrations:** ~$30K/year.
+- **Total ~$125K/year ≈ $250/rep/year.** ROI: if each rep closes one extra deal/year from better prep, payback is immediate.
+
+### Latency math
+
+Async target: 60 seconds from request to delivered brief.
+
+| Phase | Time |
+|---|---|
+| Plan | 1-2s |
+| Parallel source fetch | 5-15s |
+| Rank + dedupe | 2-5s |
+| Write + verify | 10-20s |
+| Format + push | 1-2s |
+| **Total** | **~30-45s** |
+
+### Eval strategy
+
+- **Citation precision.** % of citations that actually support the claim. LLM-as-judge sample.
+- **Freshness.** % of sources < 30 days old.
+- **Factuality on numbers.** Spot-check financial figures vs. EDGAR / earnings releases.
+- **Rep edit-rate.** % of briefs reps edit before using (low edit = high quality).
+- **Outcome lift.** A/B test: reps using briefs vs. control on win rate. 1-2 quarter measurement.
+
+### Curveball Q&A for Case 7
+
+**Q: How do you handle scraping legality / TOS?**
+
+A: Three principles. (1) Prefer official APIs over scraping. (2) Use commercial search APIs (Brave, Serper, Tavily) that handle the scraping legally. (3) Respect robots.txt and rate limits. For sites that ban scraping (LinkedIn famously), use their official API (Sales Navigator) or paid data partners. Never scrape competitors' sites directly.
+
+**Q: What if the brief gets a fact wrong and the rep cites it on a call?**
+
+A: Two defenses. (1) Visible citations + hyperlinks — the rep can verify in 10 seconds. (2) Confidence labels on each claim ("High confidence: from SEC filing" vs. "Reported: from news, unverified"). Reps trust calibrated systems more than confident ones; calibration is the integrity move.
+
+**Q: How would you measure "did this help close more deals"?**
+
+A: Hardest question in sales tech. (1) Pre/post deployment win-rate by rep cohort. (2) A/B by territory if possible. (3) Rep-self-report instrument ("did this brief give you a useful talking point?"). (4) Time-saved metric (reps freed from manual research). I'd never claim causality from win-rate alone — confounders are everywhere — but the panel of metrics tells a credible story.
+
+**Q: What's the privacy concern with this system?**
+
+A: Search-side data leakage — a competitor watching paid-search APIs could infer your sales targets from query patterns. Mitigation: use proxy / aggregated search where possible; use APIs that don't leak referrer; document this risk for security review. Also: never include rep names in API calls.
+
+**Q: How do you keep this from becoming a stalking tool?**
+
+A: Bounded scope: company-level facts, public-domain personal facts (LinkedIn role, publicly stated quotes). No personal data harvesting (no home addresses, family info, etc.). Audit trail of every individual queried; legal review of personal-data flows. Sales enablement, not OSINT.
+
+---
+
+## Case Study 8: Compliance / Regulatory Q&A System
+
+### The scenario
+
+> "Design a Q&A system for a 10K-person financial services company. Compliance officers and front-line bankers ask questions about regulations, internal policies, and audit findings. Wrong answers create regulatory risk. Every answer must cite specific clauses."
+
+### Why this is a distinct archetype
+
+**Citation isn't optional — it's the product.** No-answer beats wrong-answer. The system has to express uncertainty. Multi-jurisdiction (federal, state, EU). Source authority matters (a regulation outranks an internal memo).
+
+### Step 1: Clarifying questions
+
+- **Source taxonomy?** Regulations, internal policies, audit findings, prior Q&A pairs — each has different authority and update cadence.
+- **Jurisdictional scope?** US fed only, or also state, EU, APAC?
+- **Audit trail requirement?** Every Q&A pair logged for X years.
+- **User trust model?** Are users lawyers (high prior knowledge) or front-line bankers (lower)?
+- **Acceptable answer when uncertain?** Refuse, defer to human, or hedge?
+
+### v1: Vanilla RAG with citations
+
+(Same shape as Case 1, with an enforced "no citation, no answer" rule.)
+
+### v1 failure modes
+
+1. **Outdated regulations.** Sources weeks stale; answers reference superseded rules.
+2. **Multi-jurisdiction confusion.** Federal vs. state rule cited for the wrong context.
+3. **Authority weighting wrong.** Internal memo cited as if it's a regulation.
+4. **Hallucinated citation IDs.** "See 17 CFR § 240.10b-5" but the rule cited doesn't address the question.
+5. **Overconfidence on edge cases.** Model expresses certainty on a genuinely ambiguous regulation.
+
+### v2: Authority-weighted retrieval + clause-grain index + abstention
+
+```mermaid
+flowchart TB
+    Q[Question] --> Jurisdiction[Jurisdiction Detector<br/>infer from user profile + question]
+    Jurisdiction --> Filter[Source filter<br/>tenant + jurisdiction + active-only]
+
+    Filter --> Search[Hybrid Search]
+    subgraph Indexes[Per-source indexes]
+        Reg[(Regulations<br/>clause-level chunks)]
+        Pol[(Policies<br/>section-level)]
+        Audit[(Audit findings)]
+        Hist[(Prior Q&A pairs)]
+    end
+    Search --> Reg
+    Search --> Pol
+    Search --> Audit
+    Search --> Hist
+
+    Search --> Score[Score with authority weighting<br/>reg > policy > memo > prior Q&A]
+    Score --> Rerank[Cross-encoder rerank]
+    Rerank --> Conf{Top-1 score<br/>>= threshold?}
+
+    Conf -->|no| Abstain[Return:<br/>'I could not find a confident answer.<br/>Possibly relevant: [low-conf links].<br/>Recommend asking compliance counsel.']
+    Conf -->|yes| Writer[Writer LLM<br/>strict citation mode]
+    Writer --> CitVer[Citation Verifier<br/>each claim → cited clause must support it]
+    CitVer -->|fail| Abstain
+    CitVer -->|pass| Answer[Answer + cited clauses]
+
+    Answer --> Audit2[(Audit log<br/>question, answer, sources, user, ts)]
+```
+
+**Key design moves:**
+- **Clause-grain chunks.** Regulations are chunked at the sub-section / clause level so citations are precise. "17 CFR § 240.10b-5(a)" — not the whole section.
+- **Authority weights.** Each source carries a weight: regulation = 1.0, policy = 0.7, memo = 0.5, prior Q&A = 0.4. Retrieval score is `relevance × authority`.
+- **Jurisdiction filter.** Inferred from user profile + question. Federal-only banker doesn't get EU MiFID II answers.
+- **Abstention threshold.** If top retrieved score < threshold, refuse to answer + show low-confidence links.
+- **Strict citation enforcement.** Writer generates only with verbatim quotes + IDs. Verifier confirms quote matches source. Mismatch → abstain.
+- **Audit log.** Every Q&A persisted with full trace. Required for regulator review.
+
+### v3: Multi-jurisdiction + version tracking + escalation routing
+
+- **Regulation versioning.** Track effective dates; user asking about Q2 2024 trade gets the Q2 2024 version of the rule, not current. Time-travel queries.
+- **Cross-jurisdiction conflict surfacing.** When fed and state rules differ, explicitly flag. "Federal Reg X says A; California rule Y says B; in CA, the stricter applies."
+- **Escalation routing.** When abstaining or low-confidence: route to specific compliance officer based on jurisdiction + topic. Not just "ask compliance" — *which* compliance person.
+- **Continuous regulatory ingest.** Daily ingest of Federal Register, state regulator updates, internal policy changes. Index refreshes within 24 hours of publication.
+
+### Cost math
+
+10K employees × 5 questions/week × 50 weeks = 2.5M queries/year.
+
+- **LLM (gpt-4o for high-stakes, ~3K in / 800 out / query):** $0.025/query × 2.5M = **$60K/year**.
+- **Retrieval / index:** ~$20K/year (small corpus, < 10M chunks).
+- **Regulatory data feeds:** $30-100K/year (Westlaw, Bloomberg Law).
+- **Hosting + ops + audit log retention:** $30K/year.
+- **Total ~$150-220K/year**, ~$20/eng/year. Tiny vs. one regulatory fine.
+
+### Latency math
+
+Interactive: < 5 seconds for confident answers; abstention can be faster.
+
+| Phase | Time |
+|---|---|
+| Jurisdiction detect | < 100 ms |
+| Hybrid retrieval | 200-400 ms |
+| Rerank | 300 ms |
+| Writer + citation verify | 1.5-3 s |
+| **Total** | **~3-4s** |
+
+### Eval strategy
+
+- **Citation precision.** Every cited clause must actually support the claim. Manual audit + LLM judge. Target 99%+.
+- **Refusal calibration.** When the system refuses, is it justified? Spot-check refusals against expert ground truth.
+- **Outdated-source detection.** Test set with deprecated regulations — does the system correctly avoid them?
+- **Multi-jurisdiction tests.** Same question, different jurisdiction tags, different correct answers.
+- **Regression: regulatory updates.** When a regulation changes, do answers update within 24 hours?
+
+### Curveball Q&A for Case 8
+
+**Q: What if a user asks something the system doesn't know — do you ever guess?**
+
+A: Never. The product *requires* abstention as a first-class outcome. Better to refuse 30% of queries than confidently answer 5% wrong on regulatory questions. The abstention message routes the user to a human compliance officer. We measure "useful refusals" (where the human follow-up was the right call) vs. "blame refusals" (where the system *should* have known).
+
+**Q: How do you keep the regulatory corpus fresh?**
+
+A: Three streams. (1) Automated ingest from Federal Register, SEC, FINRA, state regulator feeds — daily diff and re-embed. (2) Internal policy updates flow via PR-style review by compliance team. (3) Quarterly audit of "stale" sources (last-updated > 12 months). Effective dates are tracked at the clause level.
+
+**Q: An auditor asks: 'show me every answer the system gave about Reg W in the past 18 months.' Can you?**
+
+A: Yes — that's the audit log structure. Indexed by (regulation tag, time window). Output: CSV of question, answer, cited clauses, user, timestamp, ID. Plus a sign-off attestation that the answer was system-generated and confidence-gated.
+
+**Q: How do you handle conflicting regulations across jurisdictions?**
+
+A: Detect the conflict explicitly. The answer surfaces both rules with a stricter-applies note. Never silently choose one. Compliance officers want to know about conflicts; presenting them is the value.
+
+**Q: What's the worst-case scenario, and how does the system prevent it?**
+
+A: Worst case: a confident wrong answer leads a banker to make a non-compliant trade → regulatory enforcement → fine + reputational damage. Prevention: (1) strict citation requirement, (2) authority weighting prevents memo-as-regulation errors, (3) abstention default for low-confidence, (4) audit log for traceability. The system is designed to fail safely — abstention is fine, wrong answer is catastrophic.
+
+---
+
+## Case Study 9: Clinical Note Drafting Assistant (HIPAA)
+
+### The scenario
+
+> "Design a tool that drafts clinical notes from doctor-patient conversations for a 200-clinic primary-care network. Doctor wears a mic; after the visit, a structured SOAP note appears in the EHR for the doctor to review and sign."
+
+### Why this is a distinct archetype
+
+HIPAA / regulated, life-safety adjacent, doctor-in-loop required, deep EHR integration, accuracy bar very high, structured output (SOAP format), medical terminology.
+
+### Step 1: Clarifying questions
+
+- **EHR system?** Epic, Cerner, Athenahealth — all have different integration paths.
+- **In-person or telehealth?** Audio capture differs.
+- **Specialty?** Primary care vs. cardiology vs. mental health — vocabulary and note conventions differ dramatically.
+- **Compliance posture?** BAA-eligible providers only. On-prem option needed?
+- **Doctor adoption model?** Mandatory or opt-in?
+
+### v1: STT + LLM → SOAP note draft
+
+```mermaid
+flowchart LR
+    Visit[Visit ends] --> Audio[Encrypted audio capture]
+    Audio --> STT[Medical STT - Nuance / Whisper-Med]
+    STT --> Trans[(De-identified transcript)]
+    Trans --> LLM[Medical LLM<br/>BAA-covered]
+    LLM --> Draft[SOAP draft]
+    Draft --> EHR[Doctor reviews + signs in EHR]
+```
+
+### v1 failure modes
+
+1. **Drug name errors.** "Metoprolol" mistranscribed as "metropolitan." Catastrophic if it goes to the script.
+2. **Allergy / contraindication errors.** Wrong fact in PMH → wrong subsequent decision.
+3. **PHI leak in non-BAA model.** Using a provider without BAA → violation.
+4. **Missing nuance.** Doctor said "rule out X" → note says "diagnosed with X."
+5. **Doctor over-trust.** Doctor signs without reviewing because workflow optimizes for speed.
+6. **Hallucinated history.** Note mentions "smokes 1 pack a day" — patient didn't say that.
+
+### v2: Medical-domain models + dual extraction + nudged review
+
+```mermaid
+flowchart TB
+    Visit[Visit ends] --> AudioE[Audio encrypted]
+    AudioE --> STT[Medical STT<br/>WER < 5% on med terms]
+
+    STT --> Diariz[Diarization<br/>doctor vs patient]
+    Diariz --> Redact[Auto-redact sensitive<br/>that shouldn't be in note]
+
+    Redact --> Dual[Dual extraction]
+    Dual --> Extract1[LLM extractor<br/>structured: SOAP sections]
+    Dual --> Extract2[Med-NER<br/>meds, doses, conditions, allergies]
+
+    Extract1 --> Cross[Cross-check]
+    Extract2 --> Cross
+    Cross --> Conflict{Conflicts?}
+    Conflict -->|yes| Flag[Flag conflicts in draft]
+    Conflict -->|no| Draft[SOAP draft]
+    Flag --> Draft
+
+    Draft --> Verify[Safety verifier<br/>drug name spell + dose sanity]
+    Verify --> EHRDraft[Push to EHR as DRAFT<br/>requires explicit sign]
+
+    EHRDraft --> Doctor[Doctor reviews]
+    Doctor --> Sign[Sign & finalize]
+    Doctor -.-> Correct[Corrections logged]
+    Correct --> Train[(Training data, weekly review)]
+
+    subgraph Compliance
+        Audit[(HIPAA audit log)]
+        BAA[All vendors BAA]
+        Encrypt[E2E encryption]
+    end
+```
+
+**Key design moves:**
+- **Medical STT.** Use a medical-trained ASR (Nuance Dragon Medical One, Whisper-MedLM). General Whisper isn't enough for drug names.
+- **Diarization + speaker filtering.** Only doctor's diagnostic statements go into the assessment; only patient's reported symptoms go into HPI.
+- **Dual extraction with cross-check.** Run a structured LLM extractor *and* a medical NER (e.g., scispaCy or AWS Comprehend Medical). Disagreements get flagged in the draft for doctor attention.
+- **Drug safety verifier.** RxNorm lookup on every drug; dose range check against standard formulary. Hallucinated drug → reject.
+- **Draft-only, never auto-finalize.** Doctor must explicitly sign. The "review" step is mandated, not opportunistic.
+- **Correction feedback loop.** Doctor edits trained into the next fine-tune.
+
+### v3: Per-specialty fine-tunes + structured EHR write-back + clinical decision flagging
+
+- **Per-specialty models.** Cardiology and dermatology have different note conventions. Per-specialty LoRA adapters.
+- **Structured EHR write-back.** Not just narrative — write structured fields (vitals, diagnoses with ICD-10, medications with RxNorm IDs). Reduces double-entry.
+- **Clinical-decision flagging (advisory, not prescriptive).** "You mentioned chest pain in a 55yo male; consider ECG per protocol X." Always advisory, never overriding doctor judgment. Liability surface managed carefully.
+
+### Cost math
+
+200 clinics × 20 doctors/clinic × 25 visits/day × 250 days = 25M visits/year.
+
+- **STT (medical-grade):** $0.10/visit × 25M = **$2.5M/year**. (Self-host with Whisper-MedLM saves significantly — ~$1M with GPU pool.)
+- **LLM (BAA-covered, ~5K in / 1K out, mid-tier model):** ~$0.05/visit × 25M = **$1.25M/year**.
+- **Compliance overhead (encryption, audit log retention, BAA contracts):** ~$200K/year.
+- **Total: ~$3-4M/year for 25M visits = $0.14/visit.** Compare: doctor time spent on notes is ~15 min/visit × $300/hr = $75/visit. Even if the system saves only 5 min/visit, ROI is enormous.
+
+### Latency math
+
+Doctor-perceived: draft must be ready by the time the doctor opens the patient chart after the visit. Target: < 2 minutes.
+
+| Phase | Time |
+|---|---|
+| STT (15-min visit) | 30-60s |
+| Diarize + redact | 10s |
+| Dual extract | 20-30s |
+| Cross-check + verify | 10-15s |
+| EHR write | 5-10s |
+| **Total** | **~90-120s** |
+
+### Eval strategy
+
+- **Drug-name accuracy.** Per-drug exact-match on a labeled set. Target 99%+.
+- **Dose safety.** % of dose values within plausible range.
+- **SOAP completeness.** Each section populated where applicable.
+- **Doctor edit-rate.** Time-series; falling rate = improving.
+- **Critical-omission rate.** Did the note miss a fact the doctor said? Spot-checked weekly.
+- **Hallucination rate.** Did the note add a fact the doctor didn't say? Spot-checked weekly.
+
+### Curveball Q&A for Case 9
+
+**Q: What's the regulatory model for an AI that drafts but doesn't sign clinical notes?**
+
+A: In the US, this is "documentation assistance" — not a medical device, no FDA approval required as long as the doctor remains the decision-maker who signs. If the system *makes diagnostic recommendations*, it crosses into clinical decision support and may need 510(k) clearance depending on risk class. Our design stays squarely on the documentation side. Any decision-support features are advisory + flagged + opt-in.
+
+**Q: What if the system mishears 'metoprolol' as 'methadone'?**
+
+A: Defense in depth. (1) Medical STT trained on med vocab (low base rate). (2) RxNorm verifier post-STT — methadone in a primary-care setting flags as unusual. (3) Per-patient PMH cross-check (was patient on methadone before?). (4) The doctor signs and is the final check. Probability of all four failing on the same note approaches negligible.
+
+**Q: How do you handle malpractice liability?**
+
+A: Vendor contracts include indemnification for system errors that fall within model limitations (with carve-outs for misuse). Plus: error patterns are tracked publicly to the doctor community so the system is "known" to fail in certain ways. Plus: doctor-must-sign workflow means legal responsibility stays with the doctor. The system's role is documented as "scribe assist," matching the conventional human-scribe liability model.
+
+**Q: What's the worst type of error?**
+
+A: Hallucinated allergy/medication. A note that says "patient denies penicillin allergy" when patient said the opposite → catastrophic downstream prescribing error. We treat this as critical: dedicated allergy NER, cross-check against existing PMH, flag any change to allergy list for doctor confirmation. Allergy changes never auto-write to structured EHR — always require explicit doctor toggle.
+
+**Q: How do you onboard a new specialty?**
+
+A: Three-phase: (1) shadow mode — system generates notes alongside human-scribe for 4 weeks; compare offline. (2) Pilot — 5 doctors opt in, weekly review of edits. (3) Roll out with specialty LoRA adapter trained on phase-2 corrections. New specialty takes 2-3 months end-to-end.
+
+---
+
+## Case Study 10: Workflow Automation Agent (Enterprise RPA Replacement)
+
+### The scenario
+
+> "Design an agent that automates business processes for a 5K-employee enterprise. Today, this is done with brittle UI-driven RPA bots (UiPath / Automation Anywhere). Replace it with an LLM-driven agent that uses APIs where possible, falls back to UI automation, and gracefully escalates."
+
+### Why this is a distinct archetype
+
+This is **the Distyl wheelhouse**. Long-running. Tool-rich. Multi-system. Stateful. Failure-tolerant by design. Often has a human handoff path. Heavy on observability and audit.
+
+### Step 1: Clarifying questions
+
+- **Process complexity?** Single-app (move data from email to ticket system) vs. multi-app workflow (intake → ERP → fulfillment → customer comm).
+- **Latency tolerance?** Real-time or batch (overnight)?
+- **Existing API coverage?** What % of systems have good APIs vs. require UI automation?
+- **Compliance / audit?** Likely high in finance/healthcare. Drives logging and approval gates.
+- **Failure model.** Idempotency, retries, rollback?
+
+### v1: Single-task agent with tool calls
+
+```mermaid
+flowchart LR
+    Trigger[Trigger:<br/>email/event/schedule] --> Agent[Agent LLM]
+    Agent --> Tools[Tool registry]
+    Tools --> API1[ERP API]
+    Tools --> API2[Email API]
+    Tools --> API3[Slack API]
+    Tools --> UI[UI Automation<br/>Playwright fallback]
+    Agent --> Result[Done]
+```
+
+### v1 failure modes
+
+1. **Brittle UI automation.** Selector breaks on page redesign.
+2. **No idempotency.** Retry creates duplicate orders.
+3. **Long-running tasks die.** Process spans 20 minutes; LLM session times out at 5.
+4. **No checkpointing.** Crash at step 8 means restart from step 1.
+5. **Unclear escalation.** When the agent fails, what does the human get?
+6. **Audit gaps.** Compliance asks "who placed this $50K order" — answer is "the agent" which isn't satisfying.
+
+### v2: Plan + checkpointed execution + UI/API fallback ladder + structured escalation
+
+```mermaid
+flowchart TB
+    Trigger[Trigger] --> Planner[Planner LLM<br/>decompose to steps]
+    Planner --> Plan[(Plan: ordered steps<br/>with checkpoints)]
+
+    Plan --> Exec[Executor]
+    Exec --> Pick{Tool layer<br/>API > SDK > UI}
+    Pick -->|API exists| API[API call]
+    Pick -->|API failed or missing| UI[UI Automation<br/>Playwright + vision LLM]
+    Pick -->|UI ambiguous| Esc[Escalate to human]
+
+    API --> Checkpoint[Checkpoint state]
+    UI --> Checkpoint
+    Checkpoint --> Storage[(Workflow state DB)]
+    Checkpoint --> Next[Next step]
+    Next --> Exec
+
+    subgraph Guards
+        Loop[Loop detector]
+        Budget[Token + time budget]
+        Idem[Idempotency keys]
+    end
+
+    Exec -.-> Guards
+
+    subgraph Recovery
+        Replay[Resume from last checkpoint]
+        Rollback[Compensating transactions]
+        EscalQ[Human queue with full context]
+    end
+
+    Exec --> Recovery
+    Esc --> EscalQ
+
+    subgraph Audit
+        Trace[Every tool call logged]
+        Approval[Approval gates for $-amount thresholds]
+        SignOff[Human sign-off for state-changing ops]
+    end
+
+    Exec -.-> Audit
+```
+
+**Key design moves:**
+- **Plan-then-execute, with checkpoints.** The planner produces an ordered, idempotent step list at the start. Each step's success state is persisted. Crash recovery resumes from last checkpoint.
+- **Tool fallback ladder.** Prefer API. If API fails or doesn't exist, use the SDK if available. If neither, fall back to vision-LLM-driven UI automation (Playwright + screenshot). Never start with UI.
+- **Idempotency keys.** Every state-changing call carries a key derived from (workflow_id, step_id). Re-run safe.
+- **Compensating transactions.** Long workflows define rollback steps. Mid-flow failure → execute compensations for already-completed mutations.
+- **Approval gates by threshold.** Spend > $X, headcount changes, anything regulated → mandatory human approval inline. Approval becomes a step in the plan, not an afterthought.
+- **Structured escalation context.** When escalating: ship the human a full trace (steps done, current state, what's blocking, suggested action). Not "agent failed."
+
+### v3: Multi-workflow concurrency + per-tenant tool ACL + drift detection
+
+- **Concurrency model.** Workflow state lives in a durable workflow engine (Temporal, AWS Step Functions, or custom on Postgres). Agent is invoked per step; engine handles retries / timeouts / fanout.
+- **Per-tenant tool ACL.** Tenant A's agent can call Tenant A's ERP only. Per-tool, per-tenant credentials in vault. Audit logs are tenant-scoped.
+- **Drift detection on UI automation.** When UI selectors fail more than X% in a week, alert + queue for re-bind. Maintain a registry of "active UI bindings" with last-success-timestamp.
+- **Process discovery.** Optionally observe humans doing workflows; suggest automations. Goes beyond replace-current-RPA to find-new-automations.
+
+### Cost math
+
+5K employees × ~50 workflows/eng/year (highly variable) ≈ 250K workflow executions/year. (Distribution skewed — top 10 workflows = 80% of volume.)
+
+- **LLM cost per workflow:** wildly variable. Simple: 10 LLM calls × $0.01 = $0.10. Complex: 100+ calls × $0.05 = $5+.
+- **Average: ~$1/workflow → $250K/year LLM cost.**
+- **Workflow engine + infra:** $50K/year (Temporal Cloud or self-host).
+- **UI automation pool (browser fleet):** $50K/year.
+- **Total: ~$350K/year**, ≈ $70/eng/year.
+- **Comparison:** RPA vendors (UiPath, Automation Anywhere) charge $4-12K per bot per year, and a company this size runs 50-200 bots → $200K-2.4M/yr. This system replaces them while being more flexible.
+
+### Latency math
+
+Long-running. Per-step latency matters, end-to-end is what it is.
+
+- Simple workflow (3 API steps): 5-15 seconds.
+- Mid workflow (10 steps, mix API + UI): 1-5 minutes.
+- Complex (50 steps, approvals): hours to days.
+
+### Eval strategy
+
+- **Per-workflow success rate.** Did the workflow complete without escalation? Baseline by workflow type.
+- **Escalation precision.** When the agent escalates, was the human action consistent with what the agent suggested?
+- **Time saved per workflow.** Compare to historical human time.
+- **Compliance audit pass rate.** Random sampled workflows pass an audit checklist.
+- **UI selector freshness.** % of UI bindings stale > 30 days.
+
+### Curveball Q&A for Case 10
+
+**Q: How is this different from existing RPA platforms?**
+
+A: Three differences. (1) **LLM-driven decisions** — the agent handles novel cases (a new email template, a slightly different invoice format) without re-coding. RPA breaks the moment selectors change. (2) **API-first** — the agent prefers APIs, leaving UI automation as fallback rather than primary, which is more stable and faster. (3) **Natural-language extensibility** — adding a new workflow is "describe it" rather than weeks of bot development.
+
+**Q: What about regulatory / SOX-controlled workflows?**
+
+A: Approval gates and audit logs are first-class. For SOX-relevant workflows (financial close, expense approval): every state-changing step requires a logged approval, with the approver's identity and timestamp persisted. The agent can prepare but never finalize without explicit human action. Auditors get a single trace per workflow with cryptographic chain-of-custody.
+
+**Q: What happens when an upstream system has an outage mid-workflow?**
+
+A: The workflow engine handles retries with exponential backoff. After max retries, the workflow pauses (not fails) and queues a notification. When the system recovers, the workflow resumes from last checkpoint. For non-idempotent steps with partial state, compensating transactions roll back to a clean state first.
+
+**Q: How do you avoid the agent doing something stupid like deleting a database?**
+
+A: Three layers. (1) **Tool ACL** — destructive tools aren't in the registry unless the workflow needs them. (2) **Per-tool approval thresholds** — `delete_records` with > 100 rows requires human approval inline. (3) **Dry-run mode** — every state-changing call has a dry-run variant; agent must run dry-run first and gate on success. Same pattern as my take-home, scaled up.
+
+**Q: When is RPA still the right answer?**
+
+A: When the workflow is fully stable, the systems don't have APIs, and the cost of LLM calls exceeds the cost of RPA bot maintenance. Highly repetitive, deterministic, never-changes workflows on legacy desktop apps where Playwright + vision-LLM is overkill. We'd keep them on RPA and migrate as the surrounding systems modernize.
+
+---
+
 ## Cross-Cutting Concepts Reference
 
 Quick-reference appendix for terms and patterns you might need.
