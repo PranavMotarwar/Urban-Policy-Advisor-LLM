@@ -70,6 +70,989 @@ Always reserve time to wrap. Interviewers love self-aware candidates.
 
 ---
 
+## Fundamentals — The Building Blocks You'll Be Quizzed On First
+
+> Before any case study, the interviewer will probe whether you understand the basic primitives. This section covers them from scratch. Each subsection is built to answer one foundational question and to give you a 30-second elevator pitch + a 3-minute deeper explanation.
+
+> Order matters: each concept builds on the previous one. RAG depends on embeddings + chunking + retrieval. Agents extend that with tools. Skills extend tools. Agentic RAG combines both.
+
+---
+
+### F1. LLM Mechanics — What You're Actually Calling
+
+**What an LLM does, in one sentence:** given a sequence of tokens, predict the next token. Repeat until a stop condition.
+
+**Vocabulary you must know cold:**
+
+| Term | Meaning | Why it matters |
+|---|---|---|
+| **Token** | The unit the model processes (~0.75 of an English word). | Tokens = cost. Tokens = context limit. Estimating in words is wrong by 33%. |
+| **Context window** | Max tokens the model can see at once (input + output). | Common 2026 sizes: 128K (GPT-4o), 200K (Claude), 1M (Gemini). Bigger isn't always better — quality degrades on long contexts. |
+| **Prompt / completion** | Input tokens / output tokens. | Priced differently. Output is 3-5× more expensive than input. |
+| **System / user / assistant roles** | Three message types in a chat call. | System sets behavior. User is the request. Assistant is the model's reply (or scaffold for multi-turn). |
+| **Temperature** | 0 → deterministic (always argmax). 1 → diverse. | RAG / agents use 0-0.2. Creative writing uses 0.7-1.0. |
+| **Top-p (nucleus)** | Sample from the smallest token set whose probabilities sum to p. | Alternative to raw temperature. Most production systems just use temperature. |
+| **Stop sequences** | Strings that, when emitted, stop generation. | Useful for structured output ("Q:" stops the model before it asks itself a follow-up). |
+| **Max tokens** | Hard cap on output length. | A safety net against unbounded generation. |
+| **Function / tool call** | Special output type where model emits JSON describing a tool to invoke. | The mechanism behind agents. |
+
+**The lifecycle of one LLM API call:**
+
+```
+your code ─→ provider API
+            ├─ tokenize prompt
+            ├─ PREFILL: parallel attention over whole prompt
+            ├─ DECODE: generate one token at a time
+            │   ├─ token 1 (first → "Time To First Token" / TTFT)
+            │   ├─ token 2
+            │   └─ ... until stop / max_tokens
+            └─ return tokens + usage stats
+```
+
+**Why prefill vs decode matters:** prefill is parallel (fast per token, but quadratic in prompt length). Decode is sequential (one token at a time). **First token latency** = prefill time. **Per-subsequent-token latency** = decode step time. The user feels TTFT; cost is dominated by total tokens.
+
+**The 30-second pitch:** "An LLM is a next-token predictor. You give it a sequence — system instructions, conversation so far, the user's question — and it generates a continuation. Two main controls: temperature for diversity, max-tokens to bound length. Cost is per-token, output 3-5× more than input, and the user feels the time to first token more than total time, which is why streaming matters."
+
+---
+
+### F2. Embeddings — Turning Text Into Vectors
+
+**What an embedding is:** a function `text → R^d` such that semantically similar texts produce vectors close to each other.
+
+```
+"How do I reset my password?"  → [0.12, -0.45, 0.78, ..., 0.03]   (1536-dim vector)
+"I forgot my login"            → [0.10, -0.47, 0.81, ..., 0.05]   (close to above)
+"Best pizza in Naples"         → [-0.88, 0.31, 0.05, ..., -0.62]  (far from above)
+```
+
+**Why we need them:** computers can't compare "meaning" of strings directly. Embeddings turn meaning into geometry — and geometry is something we can search at scale (nearest-neighbor lookup in milliseconds even over millions of vectors).
+
+**How similarity is measured:**
+- **Cosine similarity:** `cos(θ) = (a · b) / (|a| |b|)`. Range [-1, 1]. Most embeddings come pre-normalized so this is just the dot product.
+- **Euclidean distance:** straight-line distance. Equivalent to cosine for normalized vectors up to a monotonic transform.
+- **Dot product:** raw `a · b`. Used when vectors aren't unit-length.
+
+**How embeddings are trained (intuition only):** contrastive learning. Show the model a pair of related texts (question + its answer) and a pair of unrelated texts. Penalize when related-pair vectors are far apart and unrelated-pair vectors are close. Repeat over billions of pairs. The model learns to project semantic meaning into geometric clusters.
+
+**Production embedding models (memorize):**
+
+| Model | Dim | Cost / 1M tok | Notes |
+|---|---|---|---|
+| `text-embedding-3-small` (OpenAI) | 1536 | $0.02 | Default. Cheap. Matryoshka (truncatable). |
+| `text-embedding-3-large` (OpenAI) | 3072 | $0.13 | Top-tier precision. |
+| `voyage-3-large` | 1024 | $0.18 | Strong domain models (legal, code). |
+| `bge-large-en-v1.5` (OSS) | 1024 | self-host | Standard OSS baseline. |
+| `e5-mistral-7b-instruct` (OSS) | 4096 | self-host (heavy) | Long context (32K). |
+
+**The 30-second pitch:** "An embedding turns a string into a vector of ~1500 numbers, such that meaningful similarity becomes geometric proximity. You compare with cosine similarity. Production: OpenAI's text-embedding-3-small is the cheap default; large or Voyage for precision. Embeddings are the backbone of retrieval — without them you'd be doing keyword matching."
+
+**Common interview pivot:** "What if the same word means different things in different contexts?" — Embeddings are context-sensitive: "bank" in "river bank" embeds differently than in "bank account." That's the whole win over bag-of-words / TF-IDF.
+
+---
+
+### F3. Chunking — Splitting Documents So Retrieval Works
+
+**Why we chunk at all:** documents are arbitrarily long, but (a) embedding models have context limits (typically 512-8192 tokens), and (b) longer chunks produce more diffuse embeddings (averaged over too many topics → poorer retrieval precision). So we split.
+
+**The fundamental tradeoff:**
+- **Small chunks** (100-200 tokens): precise embeddings, but each chunk lacks context.
+- **Large chunks** (1000+ tokens): rich context, but embeddings are mushy and less discriminative.
+- **Sweet spot:** 300-600 tokens for general prose.
+
+**Strategies, ranked by sophistication:**
+
+**1. Fixed-size split.** Every N tokens, split. Trivial. Cuts mid-sentence. Use only for chat logs / unstructured.
+
+**2. Sentence / paragraph split.** Respect natural boundaries. Decent default but chunks vary 10-2000 tokens → uneven embedding quality.
+
+**3. Recursive character split (LangChain default).** Try paragraph break, fall back to sentence, fall back to phrase, fall back to character. Hierarchical respect for structure. Good general-purpose default.
+
+**4. Sliding window with overlap.** Fixed chunk size (e.g., 500 tokens) with 50-100 token overlap. Overlap ensures cross-boundary information appears in at least one chunk in full. Standard for prose. Industry default.
+
+**5. Semantic chunking.** Embed each sentence, cluster by similarity, split where similarity drops. Respects topic shifts. 3-5× slower ingestion. Worth it for narrative content (essays, reports).
+
+**6. Document-structure-aware.** Parse Markdown / HTML / PDF structure; chunk by heading + section. Best for wikis, documentation.
+
+**7. Hierarchical (parent-child).** Index small chunks for retrieval; on hit, expand to parent paragraph for context. Two indexes. Gold standard for high-quality RAG.
+
+**Special cases — never split:**
+- **A table.** Rows must stay together; cells need their headers. Use Unstructured.io or Azure DI to keep tables intact.
+- **A function** (in code). Chunk by function/class with tree-sitter.
+- **A list with a leading sentence.** "Steps to reset password:" → keep with the numbered list.
+
+**Diagram (sliding window with overlap, the most common):**
+
+```
+Doc:    [================================================]
+Chunk1: [============]
+Chunk2:           [============]
+Chunk3:                     [============]
+        |--500 tok--|---50 tok overlap---|
+```
+
+**Knobs to memorize:**
+- Chunk size: **300-600 tokens** for prose.
+- Overlap: **10-20% of chunk size** (50-100 tokens).
+- For code: chunk by function / class boundary, no overlap.
+- For tables: keep intact, no splitting.
+
+**The 30-second pitch:** "Chunking is splitting long documents into retrieval units. The tradeoff is precision vs context — small chunks embed sharply but lose context, large chunks have context but embed mushily. Default is recursive with 400-token chunks and 80-token overlap. For tables and code, structure-aware chunking. For high-quality RAG, hierarchical: index small, retrieve, expand to parent."
+
+**Common interview pivot:** "How do you choose chunk size for your corpus?" — Run an eval. Take your golden set; for each question, mark which chunks contain the answer. Try chunk sizes 200/400/800; measure recall@k. Pick the size where recall plateaus.
+
+---
+
+### F4. Vector Search — Finding Neighbors at Scale
+
+**The problem:** you have 10M document chunks, each with a 1536-dim embedding. A query comes in with its own embedding. You need the top-10 most similar chunks. Brute force is O(N): 10M cosine comparisons per query, too slow.
+
+**The solution:** **Approximate Nearest Neighbor (ANN)** indexes. Trade exactness (you might miss ranks 8-9-10 occasionally) for massive speed (10ms instead of seconds).
+
+**The three main index types:**
+
+**1. Flat (brute force).** Exact kNN, O(N) per query. Acceptable below ~100K vectors. The baseline.
+
+**2. IVF (Inverted File Index).** Cluster the corpus into K centroids (k-means). At query time, find the nearest M centroids and search only within them. Tunable: K (number of clusters), M (clusters to search). Saves memory but recall@k can dip if M is too small.
+
+**3. HNSW (Hierarchical Navigable Small World).** A multi-layer graph: top layer has few nodes with long-range jumps; lower layers densify until the bottom layer connects every vector to a few neighbors. Search: greedy descent from top. Logarithmic-ish search complexity. **The default for most modern vector DBs.** Memory-heavy (1.5-2× vector size for graph structure).
+
+**HNSW knobs (memorize for interview):**
+
+| Knob | What it controls | Typical |
+|---|---|---|
+| `M` | Max neighbors per node | 16-64 |
+| `ef_construction` | Effort during index build | 200-400 |
+| `ef_search` | Effort at query time | 50-200 |
+
+Higher M / ef = higher recall, more memory / latency. Tune per workload.
+
+**Vector DBs (a quick map):**
+
+| DB | Index | When to use |
+|---|---|---|
+| **pgvector** (Postgres) | HNSW or IVF | < 50M vectors; want one DB |
+| **Pinecone** | proprietary HNSW | Managed, zero ops |
+| **Weaviate** | HNSW + BM25 | Need hybrid out-of-box |
+| **Qdrant** | HNSW + filters | Heavy metadata filtering |
+| **Milvus** | multi-index | > 100M vectors |
+
+**The 30-second pitch:** "Vector search is finding the nearest neighbors of a query vector among millions of indexed vectors. Brute force is O(N) and too slow. The standard solution is HNSW — a layered graph that gives you logarithmic-ish search. The tradeoff: approximate (you might miss the true top-10 occasionally) for milliseconds-per-query at scale. Tune ef_search if you need higher recall."
+
+---
+
+### F5. Hybrid Search — Dense + Sparse Together
+
+**The problem with dense-only:** embeddings are great at semantic match ("forgot my login" ≈ "reset password") but weak on exact lexical match (an employee ID, a model number, a person's name). Dense models *learn meanings*; they don't *memorize tokens*.
+
+**The problem with sparse-only (BM25):** keyword match is great when the user's words appear in the document but fails when they paraphrase ("reset password" → doc says "credential recovery").
+
+**The fix:** run both. Combine results.
+
+**BM25 in one paragraph:** an evolved TF-IDF. For each term in the query, weight by how often it appears in the document (TF), inverse-weighted by how common it is across all documents (IDF), with saturation so a million occurrences doesn't beat a hundred. Per query, returns ranked document list. Implemented natively in Postgres (`tsvector`), Elasticsearch, Whoosh, and most vector DBs.
+
+**Combining results: Reciprocal Rank Fusion (RRF).** For each candidate document, sum:
+
+```
+RRF_score(doc) = Σ over each ranked list:  1 / (k + rank_in_list)
+```
+
+`k=60` is the canonical constant. It's a hyperparameter; lower k weights top ranks more, higher k flattens.
+
+Why RRF instead of weighted sum of scores? Dense scores and BM25 scores are on different scales (cosine 0-1 vs. BM25 unbounded). Normalizing them is a mess. RRF works on *ranks*, which are scale-free.
+
+**Worked example:**
+
+| Doc | Dense rank | BM25 rank | RRF score |
+|---|---|---|---|
+| A | 1 | 5 | 1/61 + 1/65 = 0.0317 |
+| B | 3 | 1 | 1/63 + 1/61 = 0.0322 |
+| C | 2 | 8 | 1/62 + 1/68 = 0.0308 |
+
+Doc B wins because it's strong in both (top-3 dense + top-1 BM25). Doc A is dense-top but mediocre BM25. Doc C is the inverse.
+
+**Diagram:**
+
+```mermaid
+flowchart LR
+    Q[Query] --> Embed[Embed]
+    Q --> BM[BM25 tokenize]
+    Embed --> Dense[Dense top 40]
+    BM --> Sparse[Sparse top 40]
+    Dense --> RRF[RRF fusion]
+    Sparse --> RRF
+    RRF --> Top[Top 20 fused]
+```
+
+**The 30-second pitch:** "Hybrid search runs dense vector search and BM25 keyword search in parallel and fuses the rankings with Reciprocal Rank Fusion. Dense handles semantic paraphrase; sparse handles exact tokens like IDs and proper nouns. RRF combines ranks not scores, so it's scale-agnostic. This is a +10-20% recall improvement over dense-only on most production corpora — table stakes for serious RAG."
+
+---
+
+### F6. Reranking — The Two-Stage Retrieval Pattern
+
+**Why a second stage at all:** the dense retrieval is fast (single embedding lookup) but lossy. The query and document are each encoded *independently* by a bi-encoder. The bi-encoder never sees them together.
+
+A **cross-encoder** reads `(query, document)` jointly and scores. Much more accurate. Much slower per call. So: bi-encoder for top-N retrieval (fast), cross-encoder for reranking the top-N (precise).
+
+**The architecture:**
+
+```
+query → embed (bi-encoder) → ANN top 50  ──┐
+query ─────────────────────────────────────┤
+                                            ├─→ cross-encoder rerank → top 5 → LLM
+top 50 docs ────────────────────────────────┘
+```
+
+**Bi-encoder vs cross-encoder:**
+
+| | Bi-encoder | Cross-encoder |
+|---|---|---|
+| Inputs | query → vector, doc → vector (independent) | (query, doc) → score |
+| Speed | One embed + ANN lookup, ~30 ms | One forward pass per pair, ~5-15 ms |
+| Quality | Good recall, mediocre precision | High precision |
+| Used for | First-stage retrieval | Reranking top N |
+
+**Production rerankers:**
+
+| Model | Latency (batch 20) | Quality | Cost |
+|---|---|---|---|
+| `cohere-rerank-3` | ~80 ms | Top-tier | $2/1K queries |
+| `bge-reranker-large` (OSS) | ~150 ms GPU | High | self-host |
+| `voyage-rerank-2` | ~100 ms | Top-tier | $0.05/1K |
+| LLM-as-reranker (gpt-4o-mini) | 500-1500 ms | Highest but expensive | $0.01-0.05 / query |
+
+**How much it helps:** typically **+10-25% recall@5** and **+15-35% precision@5** over bi-encoder-only. The single highest-ROI quality lever in RAG.
+
+**The 30-second pitch:** "Reranking is the second stage of two-stage retrieval. First stage gets you the top 50 candidates fast using bi-encoder embeddings. Second stage uses a cross-encoder — which sees query and document together — to rerank into the top 5 with much higher precision. Adds 80-300ms but usually +10-25% recall. The Cohere Rerank API is the lazy default that beats most hand-tuned setups."
+
+---
+
+### F7. RAG (Retrieval-Augmented Generation) — The Full Pipeline
+
+> The interview will start here. Be able to draw this from memory in 2 minutes.
+
+**The problem RAG solves:** an LLM doesn't know your private data, can't reliably cite sources, and hallucinates on out-of-distribution topics. RAG injects relevant retrieved context into the prompt so the model has the right material to answer from.
+
+**The basic pipeline:**
+
+```mermaid
+flowchart LR
+    User([User Query]) --> Embed[Embed query]
+    Embed --> Search[(Vector DB<br/>top K chunks)]
+    Search --> Build[Build prompt:<br/>system + chunks + query]
+    Build --> LLM[LLM]
+    LLM --> Answer[Answer + citations]
+```
+
+**Plus the offline ingestion side:**
+
+```mermaid
+flowchart LR
+    Docs[(Raw docs)] --> Parse[Parse: PDF/HTML/etc]
+    Parse --> Chunk[Chunk]
+    Chunk --> EmbedI[Embed each chunk]
+    EmbedI --> Index[(Vector DB)]
+```
+
+**Step by step, what happens on a query:**
+1. **Embed the query** (~30 ms, ~$0.00002).
+2. **Vector search** for top-k chunks (~30 ms with HNSW).
+3. *(Optional)* **Rerank** top-k to top-5 with cross-encoder (~150 ms).
+4. **Build the prompt:** system prompt + retrieved chunks (with source IDs) + user query.
+5. **Call the LLM** with the assembled prompt. Stream tokens back.
+6. *(Optional)* **Verify citations:** check each claim cites a chunk.
+
+**Why each step matters:**
+- *Embed*: turn the question into a vector you can search with.
+- *Search*: find the most semantically relevant chunks.
+- *Rerank*: precision boost.
+- *Prompt build*: give the LLM the material to answer from.
+- *LLM*: generate the answer using context.
+- *Verify*: defend against hallucination.
+
+**The minimum viable prompt template:**
+
+```
+SYSTEM: You answer questions using the provided context.
+Cite sources as [doc_id]. If the context doesn't contain the answer,
+say "I don't know."
+
+CONTEXT:
+[doc_id=1] {chunk 1 text}
+[doc_id=2] {chunk 2 text}
+[doc_id=3] {chunk 3 text}
+
+USER: {question}
+```
+
+**Critical RAG design choices (the interviewer will probe each):**
+1. **Chunk size + overlap** (see F3).
+2. **Embedding model** (see F2).
+3. **Hybrid or dense-only** (see F5).
+4. **Rerank or not** (see F6).
+5. **Top-k** (typical: retrieve 20-50, rerank to 3-7).
+6. **Citation enforcement.**
+7. **Abstention behavior** (when retrieval is weak, refuse vs. guess).
+
+**Common failure modes (have these ready):**
+- Retrieval doesn't find the relevant chunk → hybrid + reranker + query rewriting.
+- Retrieved chunk is right but model still hallucinates → strict citation requirement + verifier.
+- User question is ambiguous → clarifying question or HyDE-style rewriting.
+- Multi-document synthesis needed but only one chunk retrieved → bump k, multi-query expansion.
+
+**The 30-second pitch:** "RAG retrieves relevant chunks from your knowledge base and stuffs them into the LLM's prompt so it can answer from your data. Offline you chunk and embed every doc into a vector DB. Online you embed the query, retrieve top-k chunks, rerank, build a prompt with the chunks plus citation instructions, and generate. The wins: private knowledge access, citations, less hallucination. The pitfalls: bad chunking, retrieval recall gaps, model still hallucinating despite context — each has known fixes."
+
+---
+
+### F8. Agentic RAG — When RAG Becomes a Loop
+
+**Vanilla RAG is one-shot:** embed query → retrieve once → generate. Works for direct questions: "What's the company holiday policy?" One retrieval is enough.
+
+**Vanilla RAG fails when:**
+- The question requires multiple retrievals: "Compare last quarter's revenue across all regions" (need data per region, then synthesize).
+- The first retrieval is weak: model doesn't know whether to answer or retrieve again.
+- The question requires decomposition: "What are the dependencies of Project X and which ones are at risk?" (two sub-questions).
+- The answer requires reasoning over retrieved data: "Is this contract compliant with policy?" (retrieve contract, retrieve policy, reason).
+
+**Agentic RAG:** the LLM decides when to retrieve, what to retrieve, how many times, and when to stop. Retrieval becomes a *tool* the LLM calls in a loop.
+
+**The architecture:**
+
+```mermaid
+flowchart TB
+    Q[User Question] --> Plan{Plan: do I have enough?}
+    Plan -->|no| Decide{What to retrieve?}
+    Decide --> Sub[Generate sub-query]
+    Sub --> Ret[(Retrieval tool)]
+    Ret --> Add[Add to working context]
+    Add --> Plan
+    Plan -->|yes| Gen[Generate answer]
+    Gen --> Verify[Verify cites context]
+    Verify -->|fail| Plan
+    Verify -->|pass| Out([Answer])
+```
+
+**Key patterns:**
+
+**1. Query decomposition.** "How does Q4 revenue compare to Q3, and what drove the change?" → decompose into: (a) retrieve Q4 revenue, (b) retrieve Q3 revenue, (c) retrieve commentary on quarterly changes. Three retrievals, one synthesized answer.
+
+**2. Self-RAG (self-reflective).** After generating a draft, the model critiques itself: "Did I support each claim with a citation? Is there a claim I should retrieve more for?" Re-retrieve where uncertain.
+
+**3. Iterative refinement.** First retrieval is broad; model identifies what's missing; second retrieval is targeted. Common in research-style queries.
+
+**4. Multi-hop reasoning.** Question requires chaining facts. "Who was the CTO of the company that acquired XYZ in 2022?" → retrieve "who acquired XYZ" → retrieve "who is/was their CTO" → synthesize.
+
+**Vanilla vs agentic — when to use which:**
+
+| Question type | Use |
+|---|---|
+| Direct, single fact | Vanilla RAG |
+| Comparison across docs | Agentic RAG |
+| Multi-hop reasoning | Agentic RAG |
+| Synthesis across many docs | Agentic RAG |
+| Routine FAQ | Vanilla RAG (cheaper, faster) |
+
+**Cost / latency tradeoff:** agentic RAG is **3-10× more expensive** and **2-5× slower** because of the loop. Use a router upstream: simple questions → vanilla, complex questions → agentic.
+
+**The 30-second pitch:** "Vanilla RAG retrieves once and generates. Agentic RAG turns retrieval into a tool the LLM can call multiple times, deciding when it has enough context. You use it for decomposed questions, multi-hop reasoning, or self-correction. Costs more — typical 3-10× per query — so route simple questions to vanilla and complex ones to agentic."
+
+**Common interview pivot:** "What if you're not sure whether vanilla is enough?" — Start vanilla, add a confidence check (LLM rates whether it has enough info), escalate to agentic only when needed. Two-tier routing.
+
+---
+
+### F9. Agents — ReAct, Planner-Executor, and the Loop
+
+**What an agent is:** an LLM running in a loop where it can call tools to interact with the world, and decides for itself when it's done. Where a normal LLM call is "one turn in, one turn out," an agent is "many turns, multiple tool calls, an emergent plan."
+
+**The ReAct pattern (Reason + Act):**
+
+```
+Loop until done:
+  Reason: "What should I do next?" (LLM emits a thought)
+  Act:    Pick a tool, emit JSON args
+  Observe: Execute the tool, append result to context
+End loop when LLM emits a "final answer" instead of a tool call
+```
+
+**Diagram of one ReAct iteration:**
+
+```mermaid
+flowchart LR
+    Ctx[Current context] --> LLM[LLM]
+    LLM -->|"thought + tool call"| Parse[Parse tool call]
+    Parse --> Tool[Execute tool]
+    Tool -->|"observation"| Append[Append to context]
+    Append --> Done{LLM said done?}
+    Done -->|no| LLM
+    Done -->|yes| Out[Final answer]
+```
+
+**Planner-executor pattern:** for complex tasks, split into two LLM roles.
+
+```mermaid
+flowchart LR
+    Task[Task] --> Planner[Planner LLM<br/>'Break task into steps']
+    Planner --> Plan[Step list]
+    Plan --> Exec[Executor LLM<br/>'Do this step']
+    Exec --> Result[Result]
+    Result --> Done{All steps done?}
+    Done -->|no| Exec
+    Done -->|yes| Final[Final synthesis]
+```
+
+**When to use which:**
+- **ReAct:** simple, exploratory tasks. "Find me the right answer." Few iterations expected.
+- **Planner-executor:** structured tasks with predictable substeps. "Refund this order" → plan: get order, verify policy, execute refund.
+- **In practice:** often hybrid — planner produces the high-level plan, executor uses ReAct within each step.
+
+**Stop conditions (memorize):**
+1. Model emits a "final answer" (no more tool calls).
+2. `iter >= MAX_ITERATIONS` (typically 10).
+3. `tokens_used >= MAX_TOKENS` (per-task budget, typically 8-16K).
+4. `wall_clock >= TIMEOUT` (typically 30-60s interactive).
+5. Loop detector trips.
+6. Cost budget trips.
+
+**Without these, agents run forever.** This is the #1 production agent failure.
+
+**Anatomy of a single agent step (the things logged per iteration):**
+
+```
+iter=3
+  - thought: "I have the order details but need refund policy."
+  - tool_call: get_refund_policy(tier="gold")
+  - tool_result: {refund_window: 30, ...}
+  - tokens_used_this_iter: 230
+  - cumulative_tokens: 1840
+  - cumulative_cost_usd: $0.018
+  - elapsed_ms: 1240
+```
+
+**When NOT to use an agent:**
+- Simple Q&A → just RAG or a single LLM call.
+- Latency-critical (< 1s) → agent loops are inherently multi-call.
+- Determinism required → agents are stochastic.
+
+**The 30-second pitch:** "An agent is an LLM in a loop that can call tools and decides when it's done. ReAct is the canonical pattern: at each step, the model reasons, calls a tool, observes the result, repeats. Planner-executor is the alternative for structured tasks. You always need stop conditions — max iterations, max tokens, max wall-clock, loop detection — or the agent runs forever. Use agents when the task needs tool use or multi-step reasoning; for simple Q&A, just RAG or a single LLM call."
+
+---
+
+### F10. Tools & Function Calling — How Agents Touch the World
+
+**The mechanics, step by step:**
+
+1. **You define tools** with JSON Schema for their arguments.
+2. **You pass the tool schemas** to the chat call.
+3. **Model emits a tool call** in its response: `{name: "get_order", arguments: {order_id: 123}}`.
+4. **You execute the tool** (HTTP call, DB query, computation).
+5. **You return the result** as a new message of role `tool`.
+6. **Model continues** with that observation in context, either calling another tool or producing a final response.
+
+**Example schema:**
+
+```json
+{
+  "name": "get_order",
+  "description": "Retrieve order details by order ID",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "order_id": { "type": "integer", "minimum": 1 }
+    },
+    "required": ["order_id"],
+    "additionalProperties": false
+  }
+}
+```
+
+**Schema discipline (interview gold — list these):**
+- **Strict mode** (`strict: true` on OpenAI). The model's output is grammar-constrained to valid JSON. Eliminates "almost JSON" failures.
+- **Defensive enums.** `status: "pending" | "shipped" | "delivered"` — model can't invent `"in_transit"`.
+- **Type constraints.** `minimum`, `maximum`, `pattern` (regex), `format` (email, date-time).
+- **Required vs optional.** Be explicit.
+- **`additionalProperties: false`.** Prevents the model from adding fields you didn't define.
+
+**Parallel tool calling:** modern providers (OpenAI, Claude 3.5+) can emit multiple independent tool calls in a single response. You execute them in parallel and return all results together. Massive latency win for independent operations.
+
+```mermaid
+sequenceDiagram
+    participant U as Your code
+    participant L as LLM
+    participant A as Tool A
+    participant B as Tool B
+
+    U->>L: "Get order 123 and customer profile"
+    L-->>U: tool_calls=[get_order(123), get_customer(456)]
+    par parallel
+        U->>A: get_order(123)
+        A-->>U: order data
+    and
+        U->>B: get_customer(456)
+        B-->>U: customer data
+    end
+    U->>L: results (both)
+    L-->>U: synthesized response
+```
+
+**Tool design rules of thumb (memorize):**
+1. **One tool, one job.** Don't make `do_everything_tool` with 50 params.
+2. **Idempotency keys** on state-changing tools (so retries don't duplicate).
+3. **Dry-run flag** on dangerous tools (refund, delete, send).
+4. **Return errors as strings the model can read** — "Order 999 not found" not HTTP 404. The model needs to understand and retry.
+5. **Per-tool timeout.**
+6. **ACL inside the tool**, not just at schema. The model can request anything; the tool enforces what the user is allowed to do.
+
+**The 30-second pitch:** "Function calling lets the LLM emit structured JSON to invoke your code. You define tools with JSON Schema (strict mode prevents invalid output); the model picks one, you execute it, return the result, the model continues. Modern models support parallel calls — independent tools run concurrently. Tools should be one-job, idempotent, with dry-run for dangerous ops. This is the bridge between an LLM and the real world."
+
+---
+
+### F11. Skills — The Anthropic Abstraction Above Tools
+
+**What a skill is:** a *package* of instructions, scripts, and reference material that an agent can load on demand to do a specific job. Skills extend an agent's capabilities the way installing an app extends a phone.
+
+**Skill vs tool — the difference (critical to know):**
+
+| Tools | Skills |
+|---|---|
+| Individual functions (`get_order`, `send_email`) | Bundled capabilities ("create a pptx", "consolidate memory") |
+| Schema-bound JSON inputs | Markdown instructions + scripts + assets |
+| Always available in the agent's context | Loaded on-demand when relevant |
+| The agent calls them | The agent reads them, then might call tools within them |
+| Per-call overhead | Per-skill load overhead |
+
+**Anatomy of a skill:**
+
+```
+my_skill/
+  SKILL.md          ← the instructions the model reads
+  scripts/          ← helper scripts the agent can execute
+    helper.py
+  templates/        ← starting templates, reference assets
+    template.pptx
+  examples/         ← example invocations
+```
+
+**The lifecycle:**
+
+```mermaid
+flowchart LR
+    Q[User asks for X] --> Match[Match skill description<br/>to user intent]
+    Match --> Load[Load SKILL.md<br/>into context]
+    Load --> Execute[Follow skill instructions<br/>call tools as needed]
+    Execute --> Done[Deliver result]
+```
+
+**Why skills exist (intuition):** an agent's system prompt has limited room. You can't stuff every possible workflow into every system prompt — it'd be huge and irrelevant most of the time. Skills are lazy-loaded expertise. The agent has a *catalog* of skill descriptions in its context; when a user request matches, it loads the full skill.
+
+**Production examples (Anthropic's first-party):**
+- `pptx` — create / read / edit PowerPoint files.
+- `docx` — Word documents.
+- `xlsx` — Excel spreadsheets.
+- `pdf` — PDF manipulation.
+- `consolidate-memory` — reflect over memory files, merge duplicates.
+
+**Skill design principles:**
+1. **Single, well-defined job.** A skill should answer "for what task?" in one sentence.
+2. **Self-contained.** Include all the context needed; don't assume the agent knows your conventions.
+3. **Description-driven matching.** The agent picks skills based on the `description` field. Make it specific.
+4. **Composable.** Skills can call tools and other skills. A `presentation` skill might use a `chart-generator` skill.
+5. **Versioned.** Treat skills as code; ship via version control.
+
+**Tool-vs-skill examples:**
+
+| Task | Tool or skill? | Why |
+|---|---|---|
+| Get current weather | Tool (`get_weather`) | One call, structured input/output |
+| Create a financial report PDF | Skill | Multi-step: template + data fetch + formatting + chart generation |
+| Send Slack message | Tool | One call |
+| Run a customer-onboarding workflow | Skill (calls many tools) | Coordinated multi-step workflow |
+
+**The 30-second pitch:** "Skills are bundled capabilities loaded on demand. Where a tool is a single function call with a JSON-schema'd interface, a skill is a folder with instructions and assets that the agent loads when the task matches. The agent reads a skill catalog of one-line descriptions and loads the full skill on a match. It keeps the system prompt small and the agent's behavior modular — like installing apps on a phone."
+
+**Common interview pivot:** "Why not just put everything in the system prompt?" — Context-window cost, distraction (irrelevant instructions degrade quality on the actual task), and modularity (can't swap pieces independently).
+
+---
+
+### F12. Memory — Working, Episodic, Semantic, Procedural
+
+**The problem:** a vanilla LLM has no memory beyond its context window. Each turn restarts from scratch. For multi-turn or long-running agents, you need a memory architecture.
+
+**Four memory tiers (memorize this taxonomy):**
+
+| Tier | Contents | Storage | Lifetime |
+|---|---|---|---|
+| **Working** | Current conversation / scratchpad | In-context (the prompt itself) | One session |
+| **Episodic** | Summary of what happened in past sessions | Vector DB or document store | Persistent per user |
+| **Semantic** | Stable facts about the user / world | Structured (KV / Postgres) | Persistent |
+| **Procedural** | Skills the agent knows how to do | Skill library, fine-tunes | Persistent, slow-changing |
+
+**Diagram:**
+
+```mermaid
+flowchart LR
+    User[User turn] --> WM[Working memory<br/>recent turns]
+    SM[(Semantic<br/>user facts)] --> Compose[Compose prompt]
+    EM[(Episodic<br/>past sessions)] --> Compose
+    WM --> Compose
+    PM[Procedural<br/>skills] --> Compose
+    Compose --> LLM[LLM]
+    LLM --> Extract[Extract new facts]
+    Extract --> SM
+    LLM --> Out[Output]
+    WM --> Roll{Approaching limit?}
+    Roll -->|yes| Sum[Summarize → EM]
+    Sum --> EM
+```
+
+**Patterns in practice:**
+
+1. **Rolling summary** (working → episodic). Every N turns or when context gets close to limit, summarize older turns. The summary replaces the verbatim turns.
+
+2. **Vector memory** (episodic retrieval). Embed every user message; on a new turn, retrieve the top-k most relevant prior messages. RAG over your own history.
+
+3. **Structured fact extraction** (semantic). Run an LLM over each turn to extract durable facts ("user is in Boston", "allergic to dairy"). Store as KV.
+
+4. **Skill library** (procedural). The Anthropic skills section (F11).
+
+**When you need full memory architecture:**
+- Long-running assistants (coaching, support over months).
+- Personalization (the system "remembers" you).
+- Cross-session continuity ("last time we talked about X").
+
+**When working memory is enough:**
+- Single-session chat.
+- One-shot Q&A.
+- Stateless workflows.
+
+**The 30-second pitch:** "Memory has four tiers: working (current conversation in-context), episodic (past sessions, retrievable), semantic (durable facts), procedural (skills). For multi-session assistants you need all four — rolling summaries push working into episodic, fact extraction populates semantic, skills are loaded from a library. For simple chat, working memory is enough."
+
+---
+
+### F13. Fine-tune vs RAG vs Prompt — When to Use Which
+
+**The decision is almost always:** start with prompt → add RAG → fine-tune only as last resort.
+
+**The matrix:**
+
+| Symptom | Try this first | Why |
+|---|---|---|
+| Model lacks specific knowledge | **RAG** | Knowledge is data; data updates daily; RAG indexes update by re-embedding |
+| Model output format inconsistent | **Prompt** (few-shot + JSON mode) | Format is a behavior; behavior is a prompt thing |
+| Model tone / persona is off | **Prompt** (system instruction + few-shot) | Same |
+| Model bad at a structured task at scale | **Fine-tune** | If you have ≥1K labeled examples, fine-tune small model |
+| Latency / cost too high | **Smaller model + cache** then **distill** | Distillation = fine-tune small model on big model's outputs |
+
+**Three reasons RAG beats fine-tune for knowledge:**
+1. **Freshness.** Your knowledge base changes daily; fine-tunes go stale the moment they're trained.
+2. **Provenance.** RAG can cite a source; fine-tune just remembers (and may misremember).
+3. **Multi-tenant safety.** RAG with per-tenant indexes is naturally isolated; fine-tune mixed data leaks.
+
+**When to fine-tune:**
+- **Stable behavioral pattern** (tone, format, structured-output schema) that prompt engineering can't reach.
+- **You have ≥1K high-quality examples.** Below that, fine-tunes underfit.
+- **Latency or cost matters more than peak quality.** Distilling a big-model behavior into a small model is a huge win.
+- **Domain language.** Tokenization-level adaptation (medical, legal, code).
+
+**LoRA / QLoRA — the practical fine-tune.** Don't full-fine-tune; train low-rank adapters. Cost: dozens of dollars not thousands. Swap adapters at inference time → per-team specialization without per-team base models.
+
+**Decision tree:**
+
+```mermaid
+flowchart TB
+    Q[Behavior or knowledge gap?] --> Type{What kind?}
+    Type -->|missing knowledge| Static{Changes often?}
+    Static -->|yes| RAG[RAG]
+    Static -->|rarely| FT_K[RAG or fine-tune]
+    Type -->|wrong format/tone| Few[Few-shot + system prompt]
+    Few -->|insufficient| FT_S[Fine-tune small model]
+    Type -->|reasoning weak| CoT[CoT + RAG examples]
+    CoT -->|insufficient| FT_R[Fine-tune w/ reasoning traces]
+    Type -->|too slow/expensive| Cache[Router + caching]
+    Cache -->|insufficient| Distill[Distill big → small]
+```
+
+**The 30-second pitch:** "Default order: prompt → RAG → fine-tune. Prompt handles behavior. RAG handles knowledge — it stays fresh, has provenance, isolates tenants. Fine-tune only if you've maxed prompting and have ≥1K examples; then use LoRA/QLoRA for cost. For latency / cost, distill big-model behavior into a small model — that's the underrated fine-tune use case."
+
+---
+
+### F14. Streaming — Why It's Non-Negotiable
+
+**The problem:** an LLM might take 3-5 seconds to generate a full response. If you wait, the user stares at a spinner.
+
+**The fix:** stream tokens as they're produced. The first token arrives in ~300-500ms; subsequent tokens flow continuously. The user feels the response is fast even though the total time is the same.
+
+**The two protocols:**
+
+- **SSE (Server-Sent Events).** One-way HTTP stream from server to client. Standard for chat completions.
+- **WebSocket.** Bidirectional, message-framed. Used for voice / OpenAI Realtime / when client also streams (audio in).
+
+**SSE format (literally what's on the wire):**
+
+```
+data: {"token": "Hello"}
+
+data: {"token": " "}
+
+data: {"token": "world"}
+
+data: [DONE]
+
+```
+
+(Each event is `data: <json>\n\n`. The blank line is the delimiter.)
+
+**The TTFT vs total-time distinction:**
+- **TTFT (Time To First Token):** what the user *feels*. Target < 500ms.
+- **Total time:** what the cost reflects. Whatever it is.
+
+**Streaming + guardrails (the gotcha):** if your output guardrail needs to validate the full response, you can't stream-and-block. Two strategies: (a) stream optimistically and emit a "retraction" message if the guardrail trips post-hoc; (b) buffer the last sentence and only release on guardrail pass. Your take-home does (a) via `AssistantInterrupted`.
+
+**The 30-second pitch:** "Streaming sends tokens as they're generated, via SSE for chat or WebSocket for voice. The user feels Time To First Token, not total time, so even a 5-second response feels fast if it starts in 400ms. The tradeoff: post-output guardrails get harder because you've already shown content; you handle that with retractions or trailing-sentence buffering."
+
+---
+
+### F15. Caching — The Three Caches You Should Know
+
+**Three different caches, three different problems:**
+
+**1. KV Cache** (inside the model, automatic).
+- Stores Key/Value attention vectors per token so generating token N+1 doesn't recompute attention against tokens 1..N.
+- Without it, decode would be O(n²) per token. With it, O(n).
+- You don't manage this; the inference server does.
+- For self-hosted: vLLM's PagedAttention is the standard implementation — pages of KV cache, shared across requests with the same prefix.
+
+**2. Prompt Cache** (provider-side, deterministic).
+- Provider caches the KV state of your *prefix*. Next request with the same prefix reuses the cached KVs.
+- You pay reduced rate on cached tokens (Anthropic: 10% of input cost; OpenAI: 50%).
+- Works only on stable prefixes (system prompt, persona, tool schemas).
+- **Order your prompt: stable first, variable last.** Reordering breaks caching.
+
+**3. Semantic Cache** (your side, fuzzy).
+- Before calling the LLM, embed the query and look up similar past queries in a vector DB. If similarity > threshold (~0.95), return the cached response.
+- Saves a full LLM call (vs prompt cache which only saves prefill).
+- Works for high-frequency repeated questions (FAQ patterns).
+- Risk: false positives. Watch your threshold.
+
+**Diagram of the layered approach:**
+
+```mermaid
+flowchart LR
+    Q[Query] --> Exact{Exact match cache?}
+    Exact -->|hit| Out[Return cached]
+    Exact -->|miss| Sem{Semantic cache?<br/>sim >= 0.95?}
+    Sem -->|hit| Out
+    Sem -->|miss| LLM[LLM call<br/>with prompt cache]
+    LLM --> Write[Write both caches]
+    Write --> Out
+```
+
+**Cache tradeoff table:**
+
+| Cache | Saves | Cost | Risk |
+|---|---|---|---|
+| KV (in-model) | O(n²) → O(n) decode | nothing | none |
+| Prompt cache (provider) | prefill time + 50-90% input cost | nothing | none |
+| Semantic cache (yours) | full LLM call | embedding ($0.00002) | false positive |
+
+**The 30-second pitch:** "Three caches at different layers. KV cache is inside the model — handles attention reuse during decode. Prompt cache is provider-side — reuses prefix KVs across requests with the same prefix, gives you 50-90% off cached tokens. Semantic cache is yours — embed the query, look up similar past queries in a vector DB, return cached response if close enough. Layered together: exact match → semantic → LLM with prompt cache. Order prompts stable-first to maximize prompt cache hit rate."
+
+---
+
+### F16. Evaluation Basics — Without This, You Can't Ship
+
+**Why this matters more than you think:** the interviewer will *always* ask about evals. Mentioning them unprompted scores points. Skipping them looks junior.
+
+**Three layers of eval, in order of when you build them:**
+
+**1. Offline eval (CI / pre-deploy).**
+- A "golden set" of 200-500 hand-curated examples.
+- Run your system on each; score with metrics; block deploys below threshold.
+- Cheap, fast, deterministic.
+
+**2. Shadow / canary (post-deploy, pre-rollout).**
+- Run new variant alongside old on real traffic; outputs discarded but compared offline.
+- Or route 1-5% of traffic to new variant; monitor for regressions.
+
+**3. Online eval (production monitoring).**
+- Sample 1-5% of prod traffic; run an LLM-as-judge; dashboard the score.
+- Catches drift, model regressions, traffic-shift issues that offline missed.
+
+**Metrics for RAG (memorize the four):**
+
+| Metric | What | Reference-free? |
+|---|---|---|
+| **Faithfulness** | Each answer claim supported by retrieved context? | Yes |
+| **Answer relevance** | Does the answer address the question? | Yes |
+| **Context precision** | Are retrieved chunks actually relevant? | Yes |
+| **Context recall** | Did retrieval get the chunks needed to answer? | **No** (needs ground truth answer) |
+
+**LLM-as-judge — the pitfalls:**
+1. **Self-preference.** Don't use the same model as both answerer and judge — judge inflates its own outputs ~5-10%.
+2. **Position bias.** In pairwise, judges prefer position A. Randomize.
+3. **Length bias.** Judges prefer longer answers. Normalize.
+4. **Verbosity bias.** Judges reward over-confident phrasing.
+
+**Mitigation:** ensemble judges (3 different model families, majority vote), validate against ~200 human-labeled examples, target Cohen's κ > 0.6 vs. humans.
+
+**Golden set curation rules:**
+- 200-500 examples is the sweet spot. Below 100: noisy. Above 1000: expensive to refresh.
+- Cover the *long tail* of question types, not just the common ones.
+- Refresh quarterly; production failures become next quarter's golden set additions.
+- Annotated by SMEs; inter-annotator κ > 0.7.
+
+**The minimum viable eval pipeline:**
+
+```mermaid
+flowchart LR
+    Golden[(Golden set)] --> Run[Run system]
+    Run --> Metrics[Compute metrics]
+    Metrics --> Bar{Above bar?}
+    Bar -->|no| Block[Block deploy]
+    Bar -->|yes| Deploy[Promote]
+    Prod[Prod traffic] -.->|1% sample| Judge[Online LLM judge]
+    Judge -.-> Alert[Drift alerts]
+```
+
+**The 30-second pitch:** "Evals are three-layered: offline golden set gates deploys, shadow / canary tests on real traffic before full rollout, online LLM-as-judge samples prod for drift. For RAG, the canonical four metrics are faithfulness, answer relevance, context precision, context recall — RAGAS implements all four. LLM-as-judge has known biases (self-preference, position, length); mitigate with ensemble judges and validation against human-labeled examples."
+
+---
+
+### F17. The Standard Production RAG Reference Diagram
+
+Have this on the tip of your tongue. If asked "draw me a production RAG," this is what you draw.
+
+```mermaid
+flowchart TB
+    User([User]) --> API[API + Auth]
+    API --> ExC{Exact cache hit?}
+    ExC -->|yes| ReturnA[Return cached]
+    ExC -->|no| SemC{Semantic cache hit?}
+    SemC -->|yes| ReturnA
+    SemC -->|no| RW[Query rewriter<br/>HyDE / multi-query]
+    RW --> Embed[Embed]
+    Embed --> Dense[(Dense retrieval<br/>top 40)]
+    RW --> BM[(BM25 retrieval<br/>top 40)]
+    Dense --> RRF[RRF fusion]
+    BM --> RRF
+    RRF --> Rerank[Cross-encoder rerank<br/>→ top 5]
+    Rerank --> Thresh{Top score<br/>>= bar?}
+    Thresh -->|no| Abstain[Refuse / escalate]
+    Thresh -->|yes| Build[Build prompt<br/>chunks + citations]
+    Build --> LLM[LLM<br/>with prompt cache]
+    LLM --> Verify[Citation verifier]
+    Verify -->|fail| Regen[Retry stricter]
+    Verify -->|pass| Stream[Stream to user]
+    Stream --> WriteCache[Write semantic cache]
+    Stream --> User
+
+    subgraph Ingest[Offline ingestion]
+        Docs[(Docs)] --> Parse[Parse]
+        Parse --> Chunk[Chunk + overlap]
+        Chunk --> EmbedI[Embed]
+        EmbedI --> Dense
+        Chunk --> BM
+    end
+
+    subgraph Obs[Observability]
+        Trace[Per-request trace]
+        Cost[Cost per request]
+        EvalP[Online LLM judge<br/>1% sample]
+    end
+
+    LLM -.-> Trace
+    LLM -.-> Cost
+    Verify -.-> EvalP
+```
+
+Memorize this shape. In an interview, draw it from memory in ~3 minutes. Then add or remove components based on the specific scenario.
+
+---
+
+## Part B: 20 Most Common Interview Questions (with Model 60-Second Answers)
+
+> Read these out loud until each answer flows in under 60 seconds. These are the warmups before any case study question.
+
+**Q1. Walk me through how RAG works.**
+
+> "RAG retrieves relevant chunks from a knowledge base and stuffs them into the LLM's prompt so it can answer using your data instead of just its training. Offline, I chunk documents — usually 400 tokens with 80 token overlap — and embed each chunk into a vector DB. Online, I embed the user query, do hybrid retrieval (dense + BM25 fused with RRF), rerank the top-40 down to top-5 with a cross-encoder, build a prompt with those chunks plus citation instructions, and stream the LLM response. Last step: a citation verifier that checks each claim points to a chunk. The wins are private knowledge, citations, less hallucination. The pitfalls are bad chunking, retrieval recall gaps, and the model ignoring context — each has known fixes."
+
+**Q2. How do you chunk a document?**
+
+> "The default is recursive character splitting — try paragraph, fall back to sentence, fall back to character — with chunks around 300-600 tokens and 10-20% overlap. For tables, use a structure-aware parser like Unstructured.io to keep rows intact. For code, chunk by function or class boundary with tree-sitter. For high-quality RAG, hierarchical chunking: small chunks for retrieval, with parent paragraphs expanded into the LLM prompt. The fundamental tradeoff is precision versus context — small chunks embed sharply but lose context, large chunks have context but mushy embeddings. I tune chunk size by running an eval at multiple sizes and picking where recall@k plateaus."
+
+**Q3. What's the difference between vanilla RAG and agentic RAG?**
+
+> "Vanilla RAG is one-shot — embed the query, retrieve once, generate. It works for direct factual questions. Agentic RAG turns retrieval into a tool the LLM can call multiple times. The model decides what to retrieve, when to retrieve more, and when it has enough to answer. Use cases: query decomposition for comparison questions, multi-hop reasoning, self-correction loops where the model critiques its own draft and re-retrieves. Cost is 3-10× higher per query and latency 2-5× slower, so I route simple questions to vanilla and complex ones to agentic."
+
+**Q4. When would you use an agent versus just an LLM call?**
+
+> "Use an agent when the task needs tool use, multi-step reasoning, or interaction with external systems — like 'process this refund' or 'research this account.' Use a single LLM call when the input fully determines the output with no external dependencies. Avoid agents for latency-critical work (< 1 second) — agent loops inherently take multiple LLM calls. Always pair agents with hard stop conditions: max iterations (10 typical), token budget, wall-clock timeout, loop detection. Without those, agents run forever."
+
+**Q5. How do tools / function calling work?**
+
+> "You define tools using JSON Schema for their arguments. You pass the schemas in the chat call. The model emits a structured 'tool call' — a JSON with name and arguments. Your code executes the tool, returns the result as a new tool-role message, and the model continues. Modern models support parallel tool calls — multiple independent calls in one response, executed concurrently. Schema discipline matters: strict mode prevents invalid output, enums prevent invented values, dry-run flags on dangerous operations, idempotency keys for retry safety, ACL checks inside the tool."
+
+**Q6. What are skills?**
+
+> "Skills are bundled capabilities loaded on demand. Where a tool is a single JSON-schema'd function call, a skill is a folder with a SKILL.md, scripts, templates, and examples — a package of expertise for a specific task. The agent has a catalog of one-line skill descriptions; when a user request matches, it loads the full skill into context. Skills keep the system prompt small and behavior modular — like installing apps on a phone. Anthropic's first-party examples include pptx, docx, xlsx, pdf, consolidate-memory. Skills can call tools and even other skills."
+
+**Q7. How are embeddings created and used?**
+
+> "An embedding is a function from text to a vector — usually 1500-3000 dimensions — such that semantically similar texts produce vectors close in cosine similarity. They're trained with contrastive learning: pull related text pairs together, push unrelated pairs apart, repeated over billions of examples. In production I'd default to OpenAI's text-embedding-3-small at $0.02 per million tokens; switch to text-embedding-3-large or Voyage for precision-critical domains. Embeddings power vector search — instead of keyword match, you compare meaning geometrically and retrieve the nearest neighbors."
+
+**Q8. How does vector search scale to millions of vectors?**
+
+> "Brute-force kNN is O(N) per query — too slow above 100K vectors. Production uses approximate nearest neighbor indexes, mostly HNSW: a layered graph with long-range jumps on the top layer and dense local connections at the bottom. Search is logarithmic-ish. Key knobs: M is max neighbors per node (16-64), ef_construction is build effort (200-400), ef_search is query effort (50-200). Higher means better recall, more memory and latency. With HNSW you get sub-100ms search over 100M+ vectors with 95-99% recall@10."
+
+**Q9. Why hybrid search?**
+
+> "Dense embeddings handle semantic match — 'forgot my login' matches 'reset password.' But they're weak on exact tokens: product IDs, model numbers, proper nouns. BM25 keyword search nails exact match but fails on paraphrase. Hybrid runs both in parallel and fuses the rankings with Reciprocal Rank Fusion — which combines ranks not scores, so it's scale-agnostic. Typical lift over dense-only is 10-20% recall@k. It's table stakes for production RAG."
+
+**Q10. What is reranking and why does it matter?**
+
+> "Reranking is the second stage of two-stage retrieval. First stage uses a bi-encoder: query and document each get embedded independently, then ANN lookup gives the top 40-50 candidates fast. But the bi-encoder never sees the pair together. A cross-encoder reads query and document jointly and produces a more precise score — much slower per call, so you only run it on the top candidates. Typical lift is 10-25% recall@5 and 15-35% precision@5. The Cohere Rerank API is the lazy default that beats most hand-tuned setups."
+
+**Q11. RAG versus fine-tuning — which when?**
+
+> "Default to RAG for knowledge, prompt for behavior, fine-tune only as last resort. RAG keeps knowledge fresh — your KB updates daily, your fine-tune is stale the moment it's trained. RAG can cite sources; fine-tunes just remember and may misremember. RAG with per-tenant indexes is naturally isolated. Fine-tune when you have a stable behavioral pattern, ≥1K labeled examples, and prompting can't reach it. Use LoRA or QLoRA — not full fine-tune. The underrated fine-tune use case is distillation: train a small model on a big model's outputs to cut latency and cost while keeping quality."
+
+**Q12. How do you evaluate a RAG system?**
+
+> "Three layers. Offline: a golden set of 200-500 examples scored against four metrics — faithfulness, answer relevance, context precision, context recall — RAGAS implements all four. Block deploys on this bar. Shadow or canary: run the new variant alongside the old, compare offline, or route 1-5% of traffic and monitor. Online: sample 1-5% of production traffic, score with an LLM-as-judge nightly, alert on drift. Watch for judge biases — self-preference, position bias, length bias — mitigate with ensemble judges and human-labeled validation aiming for Cohen's κ > 0.6."
+
+**Q13. What's KV cache, in plain English?**
+
+> "When a transformer generates a token, it computes attention against every previous token using K and V vectors per token. Without caching, generating the Nth token would be O(N²). With KV cache, you store the K and V from previous tokens and only compute new attention. So decode is O(N). For a 70B model in FP16 it's about 0.32 MB per token — at a 4K context that's 1.3GB per request, which dominates GPU memory and gates batch size. Production techniques: PagedAttention in vLLM for memory efficiency, prefix sharing across requests with the same system prompt, INT8 KV quantization for 2× memory savings."
+
+**Q14. What's prompt caching and how does it save money?**
+
+> "Provider-side caching of the KV state for a prefix. If your next request starts with the same prefix, the provider reuses cached KVs instead of recomputing prefill. You pay reduced rate on cached tokens — Anthropic is 10% of normal, OpenAI is 50%. For a typical RAG request with a 2000-token stable system prompt, hitting cache saves ~80% of input cost. The catch: cache only works on stable prefixes. So order your prompt stable-first: system instruction, tool schemas, persona — then variable content at the end. Never embed timestamps or request IDs in the cacheable section."
+
+**Q15. What's the difference between prompt caching and semantic caching?**
+
+> "Different layers. Prompt cache is provider-side, deterministic — exact prefix match, saves prefill time and 50-90% of input cost. Semantic cache is yours — embed the query, look up similar past queries in a vector DB, if similarity is above ~0.95 return the cached response. Saves a full LLM call. Tradeoffs: prompt cache is risk-free; semantic cache has false positive risk so you need a high threshold and tenant-aware partitioning. Layered design: exact-match cache → semantic cache → LLM with prompt cache."
+
+**Q16. How would you stop an agent from looping forever?**
+
+> "Five defenses. Hard caps on iterations (typically 10), tokens (8-16K per task), and wall-clock (30-60s interactive). Repeated-call detection: hash tool name + args; trip if three identical in a row. State-hash detection: hash the working context; trip if it repeats. Oscillation detection: look at the last four tool calls for A-B-A-B patterns. Recovery options on a trip: force-summarize prompt that asks the model to produce a best-effort partial answer, hand off to a human queue, or reset to a higher-level planner."
+
+**Q17. How do you handle hallucination in RAG?**
+
+> "Defense in depth. Retrieval first — better recall means the model has the right material. Then prompt engineering — strict citation requirement, instruction that if context doesn't support an answer the model should say 'I don't know.' Then verification — programmatic check that each claim cites a chunk, semantic check via LLM-as-judge that the chunk supports the claim. Then abstention — if retrieval confidence is below threshold, refuse to answer rather than guess. Hallucination isn't a single problem; it's a property of weak retrieval, weak prompting, or weak verification. Fix the weakest link."
+
+**Q18. What's streaming and why is it important?**
+
+> "Streaming sends tokens as they're generated rather than waiting for the full response. Two protocols: SSE for chat (server-to-client, HTTP), WebSocket for voice or anything bidirectional. The user feels Time To First Token, not total time — a 5-second response feels fast if it starts in 400ms. The gotcha is output guardrails: if you stream optimistically and a guardrail fails halfway, you need to retract. Two patterns: emit an 'interrupted' signal and let the UI handle it, or buffer the trailing sentence so you can pull back."
+
+**Q19. What's the latency budget of a typical RAG call?**
+
+> "Streaming TTFT target is under 500ms. Roughly: 30-80ms for embedding, 20-80ms for vector search, 100-300ms for reranking, 200-800ms for LLM prefill, 150-400ms for first decoded token. Total TTFT in the 400-900ms range is achievable. Full streaming response 1.5-3s. Levers: prompt cache cuts prefill, smaller model cuts decode, speculative decoding cuts decode by 2-3×, parallel tool execution for agents. P99 is what users remember, and it's typically 3-5× P50 due to network and tail latency — alert if it exceeds 5×."
+
+**Q20. How do you keep an LLM system within budget?**
+
+> "Three layers of cost control. Architectural: route easy queries to a small model, use semantic cache on FAQ-shaped traffic, enable provider prompt caching, audit prompts to kill dead instructions. Operational: per-tenant daily budget with throttle and reject, per-feature budget so 'bulk export' doesn't starve 'interactive chat,' per-request token cap as a safety net against runaway agents. Observational: cost attribution per LLM call — wrap every provider call in code that tags caller_id, tenant_id, model, tokens, cost — and dashboards for cost per request P50/P95/P99, prompt cache hit rate, tokens-in:tokens-out ratio. Anomaly band on daily spend with 1.3× moving-average alerts."
+
+---
+
 ## Case Study 1: Enterprise Document Q&A (RAG)
 
 ### The scenario
@@ -1345,984 +2328,394 @@ A: I'd pick **task completion rate**, because it's the headline business outcome
 
 ---
 
-## Case Study 4: AI Coding Assistant (Copilot-style)
+## Practice Drills — One Fundamental at a Time
 
-### The scenario
+The 7 drills below are NOT full case studies. They are **focused 5-minute drills** that pressure-test a single fundamental (F1–F17) you saw earlier. Use them like this:
 
-> "Design an AI coding assistant for a 2,000-engineer company. Engineers work in a monorepo of 8 million lines across 12 languages. The assistant should suggest code completions in-IDE, answer questions about the codebase, and help draft small PRs."
+1. Read only the prompt. Close the doc.
+2. Whiteboard the answer in your head using the 30-second clarifier + the architecture sketch.
+3. Open the doc. Compare. The "three decisions you must defend" are the meat.
 
-### Why this is a distinct archetype
+Each drill maps to the fundamental it tests, so if you miss one, you know exactly which F-section to re-read.
 
-Code is structured text with semantics. Retrieval is over code units (functions, classes, files), not paragraphs. Latency budget is brutal — sub-200ms for inline completions. Quality bar is high (compiling code, not approximations). Output is verifiable (it either parses or it doesn't).
-
-### Step 1: Clarifying questions
-
-- **Three modes or one?** Inline complete vs. chat-style Q&A vs. PR drafting are very different latency and quality profiles. Often three different products under one brand.
-- **Privacy posture?** Does the code leave the company perimeter? On-prem self-host vs. private cloud vs. provider API changes everything.
-- **Languages and frameworks?** Polyglot or mostly Python+Go? Indexing strategy and model choice depend on this.
-- **What "right" means.** Edit-acceptance rate? Compile rate? Time saved per task?
-
-### v1: Baseline — provider-API copilot
-
-```mermaid
-flowchart LR
-    IDE([IDE plugin]) --> Edge[Edge gateway<br/>auth + rate limit]
-    Edge --> Ctx[Context Builder<br/>last 20 lines + filename]
-    Ctx --> LLM[Code LLM<br/>provider API]
-    LLM --> Filter[Output filter<br/>strip comments, dedupe]
-    Filter --> IDE
-
-    subgraph Telem[Telemetry]
-        Accept[Acceptance tracker]
-        Lat[Latency metrics]
-    end
-    IDE -.-> Accept
-    LLM -.-> Lat
-```
-
-**v1 in words:** IDE plugin sends the current file's last 20-50 lines and filename. LLM returns a completion. Plugin shows ghost text. User accepts (Tab) or rejects.
-
-### v1 failure modes
-
-1. **No repo awareness.** Can't reference a function defined three files away. ~40% of useful suggestions need cross-file context.
-2. **Latency tail.** Provider P99 of 1.5s makes Tab-complete feel laggy. Anything > 300ms users start ignoring.
-3. **Hallucinated APIs.** Calls `requests.fetch()` because the model knew it from JS. Embarrassing.
-4. **Privacy mismatch.** Engineers complain code leaves the building.
-
-### v2: Repo-aware retrieval + small fast model + speculative
-
-```mermaid
-flowchart TB
-    IDE[IDE plugin] --> Edge[Edge gateway]
-    Edge --> Intent{Intent}
-    Intent -->|inline complete| Fast[Fast path<br/>small code LLM<br/>self-hosted vLLM]
-    Intent -->|chat or PR draft| Slow[Quality path<br/>big code LLM]
-
-    subgraph FastPath[Fast Path]
-        Fast --> CtxLocal[Local file context<br/>+ open buffers]
-        Fast --> RepoIdx[(Repo Embedding Index<br/>per-function)]
-        Fast --> ASTCtx[Tree-sitter AST context<br/>imports, types in scope]
-    end
-
-    subgraph SlowPath[Slow Path]
-        Slow --> Plan[Plan agent]
-        Slow --> RepoIdx2[(Same repo index)]
-        Slow --> Test[Run-tests sandbox]
-        Slow --> Compile[Compile sandbox]
-    end
-
-    Fast --> SpecDec[Speculative decoding<br/>draft 1B → verify 8B]
-    SpecDec --> Filter[Output: parse check]
-    Filter --> IDE
-
-    subgraph Ingest[Code ingestion]
-        Repo[(Git repo)] --> Walker[AST walker tree-sitter]
-        Walker --> Chunker[Function-level chunks]
-        Chunker --> EmbedC[Code embedding model]
-        EmbedC --> RepoIdx
-    end
-
-    subgraph Eval[Eval pipeline]
-        ETC[Edit-Trial Compilation]
-        EAR[Edit-Acceptance Rate]
-        SWE[SWE-bench style tests]
-    end
-```
-
-**Key design moves:**
-- **Two-speed product.** Inline completion runs a small fast model (1-3B class) self-hosted with speculative decoding; PR drafting / chat runs a big model. Same brand, two backends.
-- **AST-aware chunking.** Tree-sitter parses every file into function/class units. Each unit becomes a chunk. Imports and type signatures are stored as separate "context cards" you can inject cheaply.
-- **Type-in-scope retrieval.** When completing inside `foo()`, your context includes the type signatures of every symbol currently in scope — not just embedded retrieval but a deterministic AST query.
-- **Parse-check guardrail.** Reject any completion that doesn't parse. Cheap, catches the "hallucinated API" class.
-
-### v3: On-prem + per-team fine-tunes + PR-author agent
-
-- **On-prem.** Self-host the 8B model on internal GPUs; code never leaves. Use Anthropic / OpenAI only for the chat/PR-draft modes with explicit redaction.
-- **Per-team fine-tunes.** Each team's PRs become training data; LoRA adapters per team capture codebase idioms. Adapter swap at inference time keeps the cost down.
-- **PR-author agent.** For larger tasks (file new function, add test, update docs), a multi-step agent: plan → write → compile → run test → critique → submit PR. Uses your Case 2 agent pattern.
-
-### Cost math
-
-Assumptions: 2,000 engineers × 200 inline completions/day × 250 working days = 100M inline calls/year. Plus 10 chat calls/eng/day = 5M chat calls/year.
-
-- **Inline (self-host 8B on 2× H100, $4K/mo amortized):** ~$50K/year hardware. At 100M calls / 8K req/sec × seconds/year ≈ utilized well. Effective: ~$0.0005/call.
-- **Chat (Claude 4.5 / GPT class):** ~$0.03/call × 5M = $150K/year.
-- **Index ingestion:** 8M LOC, ~800K functions, embed once + delta updates. ~$5K/year.
-- **Total ~$210K/year for 2K engineers = $105/eng/year.** Compare to GitHub Copilot Enterprise at ~$240/eng/year — your homegrown beats it on cost *and* keeps code on-prem.
-
-### Latency math
-
-| Phase | Target ms | Reality |
+| Drill | Prompt in one line | Fundamentals tested |
 |---|---|---|
-| Network out → edge | 10 | OK |
-| Auth + rate limit | 5 | OK |
-| Context build (AST + embed) | 30 | Pre-cached for active buffer |
-| Vector lookup | 20 | HNSW small index |
-| LLM prefill (small model, 2K ctx) | 80 | OK with speculative |
-| LLM decode (50 tok output) | 100 | Speculative cuts this from 200 |
-| Parse check | 5 | Tree-sitter is fast |
-| Total TTFT | **~250ms** | Acceptable for inline |
-
-### Eval strategy
-
-- **Offline:** SWE-bench Lite for PR-style tasks; HumanEval/MBPP for function gen; internal "edit-trial-compilation" benchmark on real historical PRs (does the model's completion match what was actually committed?).
-- **Online:** edit-acceptance rate (Tab vs. Escape). The headline metric. Healthy is 25-35%.
-- **Quality floor:** completions that don't parse → reject. Zero tolerance.
-- **Per-language:** track acceptance by language; weak languages get targeted prompt or fine-tune work.
-
-### Curveball Q&A for Case 4
-
-**Q: How do you avoid leaking secrets through completions?**
-
-A: Two layers. (1) At ingestion: redact secrets from indexed code using regex + entropy detection; never embed a `.env`. (2) At inference: scan completions for secret-shaped strings before showing. Plus: indexed corpus excludes anything in `.gitignore`. The engineer-facing path is never the place to learn secret hygiene.
-
-**Q: What if the model suggests vulnerable code?**
-
-A: Layer in a security linter (Semgrep, CodeQL rules) as a post-output guardrail. Completion fails the security check → silent reject (not "blocked" — that disrupts flow). Track suppression rate as a metric. Periodically run red-team prompts ("write a SQL handler") to verify the linter is catching real cases.
-
-**Q: How do you handle the cold-start problem for a new repo?**
-
-A: First-pass embed everything. While that runs, the assistant works in "no-repo-context" mode (worse but functional). For very new repos, lean harder on the AST-aware context (imports, type signatures) which works without embeddings. Acceptance rate dips for the first 24 hours; back to baseline by day 2.
-
-**Q: How do you measure "quality" without ground truth?**
-
-A: Acceptance is the proxy. Plus: 24-hour edit-survival rate (was the completion still there a day later, unmodified?). Plus: compile rate on the resulting file. Plus: quarterly user satisfaction surveys. No one of these is sufficient; the panel of three is the practical signal.
-
-**Q: When would you NOT use this and just keep GitHub Copilot?**
-
-A: When engineering org < 200 and security posture allows code to leave. The on-prem advantage matters most at scale and in regulated industries; below that, Copilot/Cursor is cheaper to operate and the cost premium is marginal vs. an engineer's time to build this system.
+| 4 | Chunk a 200-page contract for Q&A | F3 (Chunking) |
+| 5 | Convert vanilla RAG → agentic RAG | F7 → F8 |
+| 6 | Add "fill this PDF" capability | F10 (Tools) vs F11 (Skills) |
+| 7 | RAG for 1,000 tenants on a $0.001/query budget | F4 (Vector Search) + F7 |
+| 8 | RAG with 85% recall but bad precision | F5 (Hybrid) + F6 (Rerank) |
+| 9 | Your RAG hallucinates in prod | F16 (Eval) + F7 |
+| 10 | Agent hits 50 tool calls and bills $20 | F9 (Agents) stop conditions |
 
 ---
 
-## Case Study 5: Document Intelligence (Invoice / Contract Extraction)
+## Drill 4: Chunk a 200-page Contract for Q&A
 
-### The scenario
+> "We need Q&A over enterprise contracts. The longest is 200 pages, 800 sections, dense legalese, lots of cross-references like 'subject to Section 4.2(b)(iii)'. Walk me through how you'd chunk it."
 
-> "Design a system that processes 50K invoices/day across 40 languages from a global enterprise's AP automation flow. The system reads each invoice (PDF or image), extracts ~30 structured fields (vendor, line items, tax, totals, PO match, etc.), and pushes to the ERP. Errors cost money and audit findings."
+**Fundamentals tested:** F3 (Chunking), F7 (RAG)
 
-### Why this is a distinct archetype
+### Clarify in 30 seconds
+1. **Single doc or corpus?** — Per-contract Q&A or cross-contract search? Changes whether we need doc-scoped retrieval.
+2. **What kind of questions?** — "What's the termination clause?" (single-shot) vs "Compare Section 4 to Section 12" (multi-hop)? Changes whether vanilla or agentic RAG.
+3. **Cross-reference resolution required?** — If user asks about Section 7 and it says "see Section 4.2(b)", do we need to also retrieve 4.2(b)? Big architecture impact.
 
-This is **vision-heavy structured extraction**, not chat. The output is JSON, not prose. Latency is asynchronous (batch). The eval is *exact match* on fields, not LLM-as-judge. Hallucinations are expensive — a wrong amount field debits the wrong account.
+### Mental model
 
-### Step 1: Clarifying questions
+Legal docs are **hierarchical** (Article → Section → Subsection → Paragraph). Fixed-size chunking destroys that structure. You want **structural chunking** that respects section boundaries, plus a **parent-child** scheme so small chunks retrieve precisely but the LLM sees enough surrounding context.
 
-- **Field criticality?** Some fields (vendor name, total) must be 99.5%+ accurate; line items can tolerate 95%. Drives architecture tier.
-- **Document quality?** Scanned PDFs vs. native PDFs vs. photos? Drives OCR strategy.
-- **PO match required?** Does the system also reconcile against POs? Becomes a retrieval + matching problem on top.
-- **Throughput?** 50K/day = ~1/sec average; 5/sec peak. Batchable.
-- **Human-in-loop policy?** Auto-approve if confidence > X; queue for human otherwise.
-
-### v1: Naive — vision-LLM end-to-end
+### Architecture sketch
 
 ```mermaid
 flowchart LR
-    Inbox([Email / S3 inbox]) --> Q[(Job Queue)]
-    Q --> Worker[Worker]
-    Worker --> Vision[Vision LLM<br/>document → JSON]
-    Vision --> Validate[Schema validate]
-    Validate -->|valid| ERP[ERP API]
-    Validate -->|invalid| HQ[Human Queue]
+  PDF[200-page PDF] --> P[Layout-aware parser<br/>e.g. Unstructured / Azure DI]
+  P --> H[Detect hierarchy:<br/>Article/Section/Para]
+  H --> S[Small chunks:<br/>300 tokens, paragraph-level<br/>with section_id metadata]
+  H --> L[Large chunks:<br/>full Section, 1500 tokens<br/>keyed by section_id]
+  S --> VS[Vector store<br/>retrieve on small]
+  L --> KV[(KV store<br/>fetch parent on hit)]
+  VS --> Q{Query} --> R[Top-k small chunks]
+  R --> P2[Pull parent Sections<br/>via section_id]
+  P2 --> LLM[LLM with parent context]
 ```
 
-**v1 in words:** PDF / image → vision model → JSON. Validate. Send.
+### Three decisions you must defend
 
-### v1 failure modes
+1. **Structural over fixed-size chunking.** Parse the PDF with a layout-aware tool (Unstructured, Azure Document Intelligence, AWS Textract). Detect section boundaries from heading patterns ("Section 4.2"). Chunk *along* those boundaries, not across. Why: a fixed 500-token window will cut a clause in half and ruin semantics. Cost: parsing is slower (1-3 sec/page) but you pay it once at ingest.
 
-1. **Layout drift.** Vendor A's invoice changes layout next quarter; model accuracy drops silently.
-2. **Numerical errors.** Vision LLMs are bad at multi-row tables. Totals don't match line items.
-3. **Long tail of vendors.** 10,000 vendors with different invoice templates; model is mediocre across all.
-4. **Cost explodes.** Each invoice = 2,500 input tokens (image) + 1,000 output (JSON). 50K/day × $0.01 = $500/day = $180K/year just on LLM.
-5. **Hallucinated fields.** Model fills `VAT_number` when not present.
-6. **Tax math wrong.** LLMs compute arithmetic poorly. `subtotal + tax != total` happens.
+2. **Parent-child (small-to-big) retrieval.** Embed at the paragraph level (~300 tokens, high precision) but store the full section as the "parent". On retrieval, fetch top-k paragraphs, then *expand* to their parent sections before sending to the LLM. Why: paragraphs retrieve precisely; sections give the LLM enough context to answer.
 
-### v2: Stage pipeline — OCR + classifier + extractor + verifier
+3. **Section-ID metadata for cross-references.** Every chunk carries `{contract_id, section_id, parent_section_id}`. When the retrieved chunk text mentions "Section 4.2(b)", a post-processor regex-extracts that reference and pulls 4.2(b) into context too. One extra retrieval, ~50ms, dramatically better answers.
 
-```mermaid
-flowchart TB
-    PDF[Incoming PDF/IMG] --> Q[(Queue)]
-    Q --> OCR[OCR + Layout<br/>Azure DI or PaddleOCR]
-    OCR --> Class[Doc Type Classifier<br/>invoice vs receipt vs contract]
-    Class -->|invoice| Layout[Layout-aware extractor]
-    Class -->|other| Reject[Route or reject]
+### Likely curveballs
 
-    Layout --> Tmpl{Known<br/>vendor template?}
-    Tmpl -->|yes| TmplEx[Template-rule extractor<br/>regex on positions]
-    Tmpl -->|no| LLM[Vision LLM extractor<br/>JSON-mode strict]
+- **Q: Why not just stuff the whole 200-page doc in a 200K context window?** A: Three reasons — (1) cost scales linearly with input tokens, ~$0.60/query on Claude Sonnet for a single 200-page doc; (2) needle-in-haystack accuracy degrades past ~50K tokens for most models; (3) you can't audit *which* section the model used. Retrieval gives citations.
+- **Q: Overlap?** A: 10–15% on the small chunks (paragraph-level) to handle clauses that span paragraph boundaries. None on parent sections (they're already big).
+- **Q: How do you handle tables in contracts (e.g., fee schedules)?** A: Parse tables separately with a table-extraction model, serialize to markdown, store as their own chunk type with `{type: "table", section_id, html: ...}`. Retrieve table chunks differently (search column headers + row content).
 
-    TmplEx --> Merge[Merge fields]
-    LLM --> Merge
-    Merge --> Verify[Verifier<br/>1: schema strict<br/>2: arithmetic check<br/>3: PO match]
-    Verify --> Conf{Confidence}
-    Conf -->|high| ERP[ERP API]
-    Conf -->|low| HQ[Human Queue]
-
-    HQ --> Annotator[Annotator UI]
-    Annotator --> Audit[(Audit log)]
-    Annotator -.-> Train[(Training data for next fine-tune)]
-```
-
-**Key design moves:**
-- **OCR before LLM.** Azure Document Intelligence or PaddleOCR gives you tokens + bounding boxes. Pass *text + layout coordinates* to the LLM, not raw image. Cuts tokens 5×, improves table reading.
-- **Doc-type classifier.** Small model (logistic regression or DistilBERT) routes to the right extractor. Don't waste vision-LLM tokens on a receipt that doesn't match the invoice schema.
-- **Per-vendor templates.** Top 100 vendors = 60% of volume. Build deterministic extractors for them: faster, cheaper, more accurate. LLM is the fallback for the long tail.
-- **Arithmetic verifier.** After extraction, run `subtotal + tax == total` and `sum(line_items) == subtotal`. If violated, mark low confidence. This is the single highest-value verifier.
-- **Confidence as routing primitive.** Per-field confidence scores → policy table → auto-approve or human-queue.
-
-### v3: Active learning + per-tenant + audit
-
-- **Active learning loop.** Human-corrected fields flow back into training data. Monthly fine-tune of the LLM extractor on accumulated corrections. After 6 months, long-tail accuracy climbs from 85% → 95%.
-- **Per-tenant data isolation.** Each customer's templates and corrections in tenant-scoped storage; no cross-tenant model leakage. Per-tenant LoRA adapter if data volume justifies.
-- **Audit-grade logging.** Every field decision has provenance: which extractor produced it, confidence, who reviewed if any. Required for SOX/financial audit.
-
-### Cost math
-
-- **OCR (Azure DI):** $1.50 / 1K pages. 50K/day × 365 = 18M pages / yr → **$27K/year**.
-- **Classifier:** self-hosted DistilBERT, negligible.
-- **Template extractor:** zero LLM cost; just compute.
-- **LLM extractor (fallback, 40% of volume after templates dominate):** 50K/day × 0.4 × $0.005 = $100/day → **$36K/year**.
-- **Human review (15% of volume × $1.50/doc reviewer cost):** ~**$40K/year**.
-- **Total: ~$103K/year** to process 18M docs. **~$0.006 / doc**.
-
-Compare: human-only AP processing at $5-15/invoice → millions per year. Automation pays back in weeks.
-
-### Latency math
-
-Async-batch is fine. End-to-end SLA: 5 minutes for 95% of invoices. P99: 1 hour (gives human queue room).
-
-| Phase | Time |
-|---|---|
-| OCR | 2-5 s |
-| Classify | < 100 ms |
-| Template path | < 200 ms |
-| LLM path | 3-8 s |
-| Verify | < 500 ms |
-| Total auto-path | 5-15 s |
-
-### Eval strategy
-
-- **Field-level F1.** Per-field exact-match accuracy on a labeled set of 2,000 invoices.
-- **Arithmetic check pass rate.** % of invoices where math validates without human intervention.
-- **Auto-approval rate.** % of invoices that go through end-to-end without humans. Target: 75-85%.
-- **False-approve rate.** Wrong fields that *passed* auto-approve. Must be < 0.5% on critical fields.
-- **Per-vendor regression detection.** Weekly accuracy by vendor — catches template drift.
-
-### Curveball Q&A for Case 5
-
-**Q: A vendor changes their invoice layout. How quickly do you detect and recover?**
-
-A: Detection: per-vendor weekly accuracy dashboard with anomaly bands. A drop > 5pp on a high-volume vendor triggers an alert. Recovery: route that vendor to the LLM fallback path (template disabled). Operator reviews ~50 fresh invoices in the annotation UI; new template gets generated (semi-automatically from the corrected examples). Round-trip is typically 24-48 hours.
-
-**Q: What if a vendor sends 10,000 invoices in a burst?**
-
-A: The queue absorbs it; workers scale horizontally on queue depth. SLA may extend from 5 min to 30 min, but no data loss. Per-tenant rate limit prevents one tenant from starving others. The human queue gets prioritized FIFO with tenant-fair scheduling.
-
-**Q: How do you handle multilingual invoices?**
-
-A: OCR is multilingual natively. LLM extraction needs a language-aware prompt; classifier output includes detected language; per-language prompt template. For low-resource languages, lean harder on templates (less LLM dependency).
-
-**Q: Why not skip OCR and just use the vision LLM end-to-end?**
-
-A: Three reasons. (1) Token cost: a 300dpi PDF page is ~2,500 image tokens; OCR'd text + layout is ~500 tokens. 5× cost savings. (2) Table accuracy: dedicated OCR + structure tools (Azure DI, Unstructured) extract tables with explicit row/col coordinates that LLMs read perfectly. End-to-end vision is mediocre on tables. (3) Auditability: OCR output is debuggable; vision-only is a black box. The tradeoff is one extra dependency, which is worth it.
-
-**Q: Where do you store the documents themselves?**
-
-A: S3 with object-lock for compliance retention; lifecycle policy moves to Glacier after 90 days; deletion only via audit-logged path. Documents are encrypted with per-tenant KMS keys.
+### Numbers to drop
+- 200-page contract → ~80K tokens → ~400 paragraph chunks → ~80 section chunks
+- Ingest cost: ~$0.50/contract (one-time, embeddings + parsing)
+- Query latency: 200ms retrieval + 50ms parent expansion + 1.5s LLM = ~1.7s p50
 
 ---
 
-## Case Study 6: Meeting Summarizer + Action Items
+## Drill 5: Convert Vanilla RAG → Agentic RAG
 
-### The scenario
+> "Your vanilla RAG works for simple lookups but fails on questions like 'Which of our SOC2 controls overlap with HIPAA, and what evidence do we have for each?' How do you upgrade it?"
 
-> "Design a Zoom/Teams plugin for a 50K-employee company. After each meeting, the system delivers a summary, key decisions, and action items assigned to specific people. It needs to integrate with the company's task tracker (Asana / Jira)."
+**Fundamentals tested:** F7 (Vanilla RAG), F8 (Agentic RAG)
 
-### Why this is a distinct archetype
+### Clarify in 30 seconds
+1. **Why is vanilla failing?** — Multi-hop? Comparison? Aggregation? Each needs a different fix.
+2. **Latency budget?** — Agentic is 3–10× slower than vanilla. Is 8-second p50 acceptable?
+3. **Cost budget per query?** — Agentic does 5–20 LLM calls. Vanilla does 1. ~10× cost.
 
-Async batch with audio input. Output is structured (summary + JSON action items). Speaker attribution matters. Calendar / task integrations are write-back side-effects. Quality is judged hours later by humans editing the output.
+### Mental model
 
-### Step 1: Clarifying questions
+Vanilla RAG = `retrieve → generate`. Agentic RAG = `plan → retrieve → reflect → re-retrieve → generate`. The LLM **drives** retrieval instead of being a passive consumer of it. You only upgrade when the question shape demands it.
 
-- **Live or post-meeting?** Live (during call) is a totally different latency profile.
-- **Speaker identification?** Need speaker diarization for attribution.
-- **Privacy.** Consent for recording; per-meeting opt-in.
-- **Integrations.** What task systems? Asana, Jira, Linear, Notion all have different APIs.
-- **Output language(s)?** Summaries in original or translated to org language?
+### Architecture sketch
 
-### v1: Sequential — STT → LLM → write-back
+```mermaid
+flowchart TD
+  Q[User question] --> R[Router LLM<br/>classify question type]
+  R -->|simple lookup| V[Vanilla RAG path]
+  R -->|multi-hop/compare/aggregate| A[Agentic path]
+  A --> D[Decompose into sub-questions<br/>LLM call #1]
+  D --> SQ[Sub-Q 1, Sub-Q 2, Sub-Q 3]
+  SQ --> RET[Retrieve per sub-Q<br/>parallel]
+  RET --> RF[Reflect:<br/>are answers grounded?]
+  RF -->|no| RE[Re-retrieve with<br/>refined query]
+  RE --> RF
+  RF -->|yes| S[Synthesize final answer<br/>LLM call #N]
+  V --> O[Answer + citations]
+  S --> O
+```
+
+### Three decisions you must defend
+
+1. **Router first, don't agentic everything.** 80% of questions are simple lookups. Use a cheap classifier (or a small LLM with structured output) to decide vanilla vs agentic. Saves 8× on cost and latency for the easy 80%.
+
+2. **Bounded planning.** The decompose step produces 2–5 sub-questions, not 20. Cap recursion depth at 2. Why: unbounded agentic loops are how you get $20 queries and 90-second responses (see Drill 10).
+
+3. **Reflection is a separate LLM call with a strict rubric.** After retrieval, ask: "For each sub-question, do the retrieved chunks contain a direct answer? Y/N + which chunk_id." If N for any, re-retrieve with a rewritten query (max 1 retry). This is "Self-RAG" lite. Why: stops the agent from confidently hallucinating when retrieval missed.
+
+### Likely curveballs
+
+- **Q: Why not always use agentic RAG?** A: 10× cost, 5× latency, more failure modes (loops, query drift), worse than vanilla for simple lookups. Use it only when question shape demands it.
+- **Q: How do you decompose well?** A: Few-shot prompt with 5 examples of (compound question → sub-questions). Strict JSON output. Test on a held-out set of multi-hop questions and measure: did decomposition produce sub-questions that, when answered, fully cover the original?
+- **Q: What stops the loop?** A: Max 2 reflection cycles. Max 8 LLM calls total per query. Hard cost cap of $0.10/query. Token-budget check before each retrieval.
+
+### Numbers to drop
+- Vanilla RAG: 1 LLM call, ~$0.005/query, p50 1.5s
+- Agentic RAG: 5–10 LLM calls, ~$0.05/query, p50 6–8s
+- Router decision: 50ms with a small model, costs ~$0.0001
+
+---
+
+## Drill 6: Add "Fill This PDF" Capability — Tool or Skill?
+
+> "Users want to upload a tax form PDF and have the assistant fill it out using data from their account. Walk me through whether this is a tool, a skill, or both."
+
+**Fundamentals tested:** F10 (Tools / Function Calling), F11 (Skills)
+
+### Clarify in 30 seconds
+1. **One form type or many?** — One = a tool. Many varied forms = a skill that *uses* tools.
+2. **Is the LLM filling in field values, or just orchestrating?** — Field values come from data lookups (tools). Orchestration (which fields, what order, validation) is a skill.
+3. **Output goes where?** — Back to user as PDF, or submitted to an API? Affects what tools you need.
+
+### Mental model
+
+**Tool** = a single deterministic API call the LLM invokes (`get_user_ssn()`, `write_pdf_field(form_id, field, value)`).
+
+**Skill** = a *playbook* (SKILL.md + scripts) that says "to fill a tax form: first parse it with `parse_pdf.py`, identify required fields, look each up via tools, write back via `fill_pdf.py`, validate with `validate_form.py`". The LLM reads the skill, then orchestrates.
+
+You almost always want **both layers**: tools for atomic actions, a skill for the recipe.
+
+### Architecture sketch
+
+```mermaid
+flowchart TD
+  U[User: 'fill my W-9'] --> LLM[LLM]
+  LLM -->|reads| SK[skills/fill_tax_form/SKILL.md<br/>+ parse_pdf.py<br/>+ fill_pdf.py]
+  SK -.guides.-> LLM
+  LLM -->|tool call| T1[parse_pdf_fields tool<br/>returns field list]
+  T1 --> LLM
+  LLM -->|tool call x N| T2[lookup_user_data tool<br/>per field]
+  T2 --> LLM
+  LLM -->|tool call| T3[write_pdf tool<br/>final filled PDF]
+  T3 --> O[Filled PDF to user]
+```
+
+### Three decisions you must defend
+
+1. **Skill encapsulates the workflow, not the data.** SKILL.md describes *how* to fill any form. The actual user data (SSN, address) lives in your DB and is fetched via `lookup_user_data(field_name)` tool calls. Skills should never embed PII.
+
+2. **Tools are narrow and idempotent.** `parse_pdf_fields(pdf_url) → list[field]`, `lookup_user_data(field_name) → value | None`, `write_pdf(pdf_url, {field: value}) → new_pdf_url`. Each one does one thing, can be retried, no hidden state. The LLM (guided by the skill) composes them.
+
+3. **Validation is its own tool, called before submit.** `validate_form(filled_pdf_url) → {ok, errors[]}`. The skill instructs the LLM to validate before returning to user. Why: a hallucinated SSN is worse than a "couldn't fill, need data" response.
+
+### Likely curveballs
+
+- **Q: Why not put the recipe in the system prompt instead of a skill?** A: System prompt scales poorly — every form type adds tokens to every request. Skills load on-demand; the LLM reads SKILL.md only when the task matches. Also, skills are versionable, ownable by domain teams, and don't pollute unrelated requests.
+- **Q: Could the LLM just do this without tools?** A: No — the LLM cannot read a binary PDF, cannot persist a filled file, cannot access user data. Tools bridge the LLM to actions in the world. The LLM provides reasoning + orchestration only.
+- **Q: How do you stop the agent from filling the wrong fields?** A: Strict JSON schema for `write_pdf` — only fields that came from `parse_pdf_fields` are valid. Reject the call at the executor if the LLM hallucinates a field name.
+
+### Numbers to drop
+- Skill file size: ~2KB (SKILL.md) + scripts
+- Skill load latency: ~10ms (file read) or one-time prompt-cache hit
+- Per-form fill: 3–8 tool calls, p50 4s, cost ~$0.02 (mostly the LLM orchestration, tools are pennies)
+
+---
+
+## Drill 7: RAG for 1,000 Tenants on a $0.001/Query Budget
+
+> "We're building a SaaS RAG product. 1,000 tenants, each with their own private knowledge base (100MB – 100GB). Cost target: $0.001 per query. How?"
+
+**Fundamentals tested:** F4 (Vector Search), F7 (RAG), cost engineering
+
+### Clarify in 30 seconds
+1. **Hard isolation or namespaced?** — Hard = per-tenant index/DB (expensive, simple). Namespaced = shared index with `tenant_id` filter (cheap, careful). Compliance answer often dictates this.
+2. **Query distribution?** — Power-law (10 tenants do 80% of queries) is very different from uniform. Drives cache strategy.
+3. **What's the model?** — $0.001/query rules out GPT-4 class for the generation step. Probably Haiku/Mini-class or open-weights.
+
+### Mental model
+
+At $0.001/query, every layer of the stack has a budget: retrieval ~$0.0002, rerank ~$0.0001, generation ~$0.0005, infra ~$0.0002. The biggest lever is **prompt caching** (Anthropic 10× cheaper on cache hits) + **a small model** for the bulk of queries.
+
+### Architecture sketch
 
 ```mermaid
 flowchart LR
-    Meeting([Meeting ends]) --> Webhook[Webhook<br/>from Zoom / Teams]
-    Webhook --> Audio[(Audio file)]
-    Audio --> STT[STT - Whisper or Deepgram]
-    STT --> Transcript[(Transcript w/ timestamps)]
-    Transcript --> LLM[LLM<br/>summarize + extract actions]
-    LLM --> Validate[Schema validate]
-    Validate --> Distrib[Distribute]
-    Distrib --> Mail[Email recap]
-    Distrib --> Task[Task tracker API]
-    Distrib --> Cal[Calendar event update]
+  Q[Query + tenant_id] --> SC[Semantic cache<br/>per-tenant namespace]
+  SC -->|hit, 30%| O[Cached answer<br/>$0.00005]
+  SC -->|miss| R[Hybrid retrieve<br/>shared index<br/>filter: tenant_id]
+  R --> RR[Cheap reranker<br/>bge-reranker-base]
+  RR --> G[Small model<br/>Haiku/Mini<br/>+ prompt cache]
+  G --> SAVE[Save to semantic cache]
+  G --> O
 ```
 
-### v1 failure modes
+### Three decisions you must defend
 
-1. **Long meetings blow context.** A 90-minute meeting at 150 wpm = 13.5K words ≈ 18K tokens. Tight but OK. 3-hour planning offsite = 36K tokens → context overflow on smaller models.
-2. **No speaker attribution.** "Someone agreed to do X" — who?
-3. **Hallucinated action items.** LLM invents actions that nobody said.
-4. **Wrong action assignee.** "John will do it" — which John? Mapping names to user IDs is hard.
-5. **Privacy.** Recording an HR conversation that was opted out.
+1. **Shared vector index, `tenant_id` filter, namespaced by partition.** One index, partitioned by tenant_id (Pinecone namespaces, Qdrant collections, pgvector partitioned tables). Why: 1,000 separate indexes = 1,000× infra overhead. With proper filtering + partition pruning, single-index latency stays ~50ms p50. Hard isolation only for regulated tenants (separate paid tier).
 
-### v2: Diarized + chunked + verified
+2. **Semantic cache per tenant, 30%+ hit rate target.** Most enterprise queries repeat ("what's our PTO policy"). Embed the query, cosine search against the tenant's cache (threshold 0.95). 30% hit rate → 30% of traffic at $0.00005 instead of $0.0008. Pays for itself in week one.
 
-```mermaid
-flowchart TB
-    Audio[Audio file] --> Consent{Consent check<br/>per participant}
-    Consent -->|deny| Drop[Discard]
-    Consent -->|allow| STT[Streaming STT<br/>with diarization]
+3. **Aggressive prompt caching.** Tenant's static system prompt + the top-k retrieved chunks form the cacheable prefix. Anthropic caches this at 10% read cost on hit. For repeated questions in the same session or by the same tenant, cache hits drop generation cost ~10×.
 
-    STT --> Trans[(Transcript<br/>speaker, time, text)]
-    Trans --> Chunk[Chunk by topic<br/>30-min windows w/ overlap]
-    Chunk --> Map[Map: per-chunk summary]
-    Map --> Reduce[Reduce: stitched summary<br/>+ action extractor]
+### Likely curveballs
 
-    Reduce --> Verify1[Verify: every action cites a transcript span]
-    Verify1 --> Resolve[Resolve assignees<br/>name → user_id via directory]
-    Resolve -->|unresolved| Ambig[Mark ambiguous<br/>queue to organizer]
-    Resolve --> Confirm[Confirm with organizer<br/>before write-back]
+- **Q: How do you prevent tenant A's data from leaking to tenant B?** A: Three layers. (1) `tenant_id` filter enforced *server-side*, never client-supplied. (2) Embeddings keyed with tenant prefix at ingest. (3) Negative test in CI: random cross-tenant query should return zero results. Audit log every retrieval with `{user_id, tenant_id, returned_chunk_ids}`.
+- **Q: What if a tenant has 100GB of docs?** A: They get their own dedicated namespace (still shared infra) + a paid tier. Auto-scale `ef_search` based on namespace size. For >50M vectors, switch to DiskANN-backed storage to keep RAM cost bounded.
+- **Q: How do you stay under $0.001 if a tenant suddenly 10× their query volume?** A: Per-tenant rate limits + per-tenant monthly budget caps (configurable). Auto-degrade: when a tenant exceeds budget, route to cheaper model (Haiku-3 → 3.5 → smaller open-weights), reduce top-k from 8 to 4, force cache-only mode.
 
-    Confirm --> Email[Email recap to attendees]
-    Confirm --> Task[Create tasks]
-    Confirm --> Audit[(Audit log)]
-```
-
-**Key design moves:**
-- **Diarization at STT layer.** Deepgram / Whisper-X provide speaker labels. Map speaker IDs to attendees via meeting participant list.
-- **Map-reduce chunking.** Chunk transcript by 20-30 min windows with 5-min overlap. Per-chunk summary first, then a "reduce" pass that stitches and de-duplicates.
-- **Citation-verified actions.** Each action item must point to a transcript span. Reject hallucinations.
-- **Name resolution.** Directory lookup (LDAP / Workday) maps "John" → user. Ambiguous names → organizer confirms.
-- **Organizer confirmation.** Don't auto-write tasks until the organizer (sender of recap) confirms. Trust ladder: auto-email recap, manual-confirm write-back.
-
-### v3: Live mode + multilingual + per-team customization
-
-- **Live transcription side-panel.** Stream STT into a panel during the meeting. End-of-meeting summary is mostly done by hangup.
-- **Multilingual.** Detect language; summarize in meeting language; offer translation to org language.
-- **Per-team templates.** Engineering meeting → has "Decisions / Action Items / Open Questions" sections; sales call → has "Customer asks / Objections / Next steps." Templates surface via meeting calendar metadata.
-
-### Cost math
-
-50K employees × 4 meetings/day × 30 min avg × 250 working days = 50M meeting-minutes/year.
-
-- **STT (Deepgram nova-2 streaming):** $0.0043/min → $215K/year.
-- **LLM summarization (gpt-4o-mini, ~5K input + 1K output / meeting):** 50K eng × 4 meetings/day × 250 days × $0.005 = **$250K/year**.
-- **Vector index / storage:** ~$15K/year.
-- **Integrations / write-back / hosting:** ~$50K/year.
-- **Total ~$530K/year for 50K employees ≈ $10.60/eng/year.** Compare with Otter.ai Enterprise (~$30-50/eng/yr); homegrown wins on price *and* lets you integrate deeply.
-
-### Latency math
-
-Post-meeting target: recap email within 5 minutes of meeting end.
-
-| Phase | Time (60-min meeting) |
-|---|---|
-| STT batch | 15-30s if streaming was on; 2-3 min if from scratch |
-| Chunk + map summarize | 30-60s parallel |
-| Reduce | 20-40s |
-| Verify + resolve assignees | 10-20s |
-| Write-back | 5-10s |
-| **Total** | **~3 minutes** |
-
-### Eval strategy
-
-- **Action-item precision.** % of extracted actions that are *real* (per the meeting host). Target > 90%.
-- **Action-item recall.** % of real actions that were captured. Target > 85%.
-- **Assignee accuracy.** % of correctly attributed actions.
-- **Summary coherence (LLM judge).** Rolling LLM-as-judge on samples.
-- **Edit distance metric.** Track how much organizers edit before sending. Falling edit rate = improving quality.
-
-### Curveball Q&A for Case 6
-
-**Q: What about confidential meetings (HR, M&A, legal)?**
-
-A: Calendar-based or organizer-flag opt-out. Meetings marked confidential never get processed — STT job is suppressed at intake. Audit logs of suppressed meetings (without content) for compliance. For HR specifically: bot-detection bypass (the recording bot doesn't join confidential meetings; calendar metadata controls).
-
-**Q: How do you handle people speaking over each other?**
-
-A: Diarization tools handle most of it; cross-talk shows as overlapping speaker labels. For consequential moments (vote, decision), prompt the LLM with "in cases of cross-talk, flag uncertainty rather than guess." Track diarization-confidence per segment; low-confidence segments are flagged for organizer review.
-
-**Q: What if the summary is wrong and triggers a wrong action in Jira?**
-
-A: That's why the v2 design requires organizer confirmation before write-back. The recap email shows proposed tasks with edit buttons. Until organizer hits "Confirm and Create," nothing hits Jira. Trust ladder: read-mode default, write-mode opt-in.
-
-**Q: How do you make this work for non-English meetings?**
-
-A: Whisper handles 90+ languages natively. Pipeline is language-agnostic at the LLM layer if you use a multilingual model. For low-resource languages, fall back to translate-then-summarize (English LLM).
-
-**Q: What's the cheapest version that's still useful?**
-
-A: Strip features, keep diarization + summary, no action-item extraction. STT cost dominates (~$220K) but you can downgrade to Whisper self-hosted on a small GPU pool (~$30K/year for the same volume). LLM cost halves (no separate action extraction). Total ~$200K/year, half the v2 cost, ~70% of the value.
+### Numbers to drop
+- Per-query cost target: $0.001. Actual achievable: $0.0006 with caching.
+- Embedding storage: 1,000 tenants × 1M chunks avg × 768-dim float16 = ~1.5TB on disk, ~150GB hot in RAM (top tenants).
+- Throughput at $0.001: 1M queries/day = $1K/day = $30K/month infra+model. Pricing must clear $0.005/query to make ~5× margin.
 
 ---
 
-## Case Study 7: Sales Research / Account Briefing Agent
+## Drill 8: RAG Has 85% Recall but Bad Precision — Fix It
 
-### The scenario
+> "Your RAG returns relevant chunks 85% of the time (recall ok), but the LLM still gives garbage answers because half the top-5 chunks are off-topic noise. Fix it."
 
-> "Design an agent that helps a B2B sales team prepare for customer meetings. Given a target company and the meeting's attendees, the agent produces a briefing: recent company news, financial signals, current tech stack, mutual connections, and likely buying triggers. Integrates with Salesforce."
+**Fundamentals tested:** F5 (Hybrid Search), F6 (Reranking)
 
-### Why this is a distinct archetype
+### Clarify in 30 seconds
+1. **What's the current retriever?** — Dense-only? You probably need hybrid. BM25-only? You probably need dense. Already hybrid? You need a reranker.
+2. **Chunk size?** — If chunks are 1000+ tokens, "off-topic noise" might be within-chunk noise; smaller chunks + parent expansion can help.
+3. **What does the LLM see?** — Top-5 raw, or are you already filtering? Affects whether the fix is upstream (retrieval) or downstream (rerank).
 
-Web-research-heavy with multiple data sources. Output is structured + narrative. Quality is freshness + factuality. Side-effect is write-back to CRM. Used 100s of times per week per rep, but each report is bespoke.
+### Mental model
 
-### Step 1: Clarifying questions
+**Recall** = "did we find the right chunk?" **Precision** = "are all top-k chunks actually relevant?" Bi-encoder retrieval optimizes recall by being fast and approximate. A **cross-encoder reranker** optimizes precision by deeply scoring (query, chunk) pairs. Two-stage retrieval = recall from stage 1, precision from stage 2.
 
-- **Data sources?** Public web + LinkedIn + paid data (Crunchbase, ZoomInfo) + Salesforce internal? Each has different API constraints.
-- **Freshness window?** A week-old report is useless for "did they just announce earnings?"
-- **Confidentiality.** Search queries can leak intent — competitors monitoring search-side data.
-- **Hallucination tolerance.** Sales accepts some narrative looseness; financial numbers must be cited.
-
-### v1: Single-shot web search + LLM summarize
+### Architecture sketch
 
 ```mermaid
 flowchart LR
-    Rep([Rep enters company name]) --> Search[Web search API]
-    Search --> Scrape[Scrape top 10 pages]
-    Scrape --> LLM[LLM<br/>summarize]
-    LLM --> Brief[Briefing]
-    Brief --> SF[Salesforce note]
+  Q[Query] --> H[Hybrid retrieve<br/>BM25 + dense, top-50]
+  H --> RRF[RRF fusion<br/>k=60]
+  RRF --> RR[Cross-encoder rerank<br/>top-50 → top-5]
+  RR --> LLM[LLM gets only top-5]
 ```
 
-### v1 failure modes
+### Three decisions you must defend
 
-1. **Search bias.** Top 10 search results are mostly press releases — over-rotates on optimistic narratives.
-2. **No internal context.** Rep loses what they had in Salesforce (past calls, contacts).
-3. **Stale data.** Wikipedia revenue figures from 2022.
-4. **Hallucinated mutual connections.** Made up LinkedIn names.
-5. **No traceability.** Numbers without source citations.
+1. **Two-stage retrieval: retrieve wide, rerank tight.** Stage 1: fetch top-50 from hybrid (BM25 + dense, fused with RRF, k=60). Stage 2: cross-encoder reranker scores all 50, keeps top-5. Why: bi-encoder is fast but approximate. Cross-encoder is slow but accurate — 50 pairs is only ~100ms with `bge-reranker-base` or Cohere Rerank.
 
-### v2: Multi-source agent with citation enforcement
+2. **Hybrid > dense-only.** BM25 catches exact-term matches (acronyms, product names, IDs) that dense embeddings miss. Dense catches paraphrases BM25 misses. RRF fuses them without hand-tuning weights: `score(d) = Σ 1 / (k + rank(d))` over both retrievers, k=60.
 
-```mermaid
-flowchart TB
-    Req([Rep request: ACME Corp meeting Tue]) --> Planner[Planner LLM]
-    Planner --> Sub[Sub-task list]
+3. **Measure precision@5 on a labeled set.** Build a 100-query eval set with ground-truth relevant chunks. Track precision@5 before/after each change. Reranker should move you from ~0.4 (raw hybrid) to ~0.8 (reranked). If it doesn't, the chunks themselves are bad — go back to F3 (chunking).
 
-    Sub --> Web[Web search subagent]
-    Sub --> News[News API subagent]
-    Sub --> Crunch[Crunchbase API]
-    Sub --> LI[LinkedIn API<br/>attendee lookup]
-    Sub --> SF[Salesforce subagent<br/>past notes, contacts]
-    Sub --> Earnings[SEC EDGAR<br/>if public]
+### Likely curveballs
 
-    Web --> Rank1[Rank + dedupe sources]
-    News --> Rank1
-    Crunch --> Rank1
-    LI --> Rank1
-    SF --> Rank1
-    Earnings --> Rank1
+- **Q: Why not just retrieve fewer chunks (top-3 instead of top-5)?** A: That trades recall for precision in the worst way — you'll often miss the right chunk entirely. Better to retrieve wider and filter aggressively with rerank.
+- **Q: Can the LLM be the reranker?** A: Yes, "LLM-as-reranker" works (prompt: "rank these 10 chunks by relevance to Q"), but it's 100× more expensive than a cross-encoder. Use it only for the last 5–10 chunks, and only if a dedicated reranker isn't good enough.
+- **Q: What if hybrid still misses the right chunk?** A: Three options — (1) query rewriting (HyDE: ask LLM to write a hypothetical answer, embed *that*); (2) multi-query expansion (LLM generates 3 query variants, retrieve for each, fuse); (3) check if the chunk even exists — could be a chunking bug.
 
-    Rank1 --> Writer[Writer LLM<br/>strict citation mode]
-    Writer --> Verify[Citation verifier<br/>every claim → source]
-    Verify -->|fail| Rewrite[Rewrite missing parts]
-    Verify -->|ok| Format[Format brief<br/>with hyperlinks]
-    Format --> SF2[Push to SF as note]
-    Format --> Email[Email to rep]
-```
-
-**Key design moves:**
-- **Planner-executor with specialized sub-agents.** Each source has its own sub-agent with bounded tool surface. Run in parallel.
-- **Source ranking + dedup.** Multiple sources may say the same thing. Source authority weighting + content-hash dedup.
-- **Strict citation mode.** Every claim in the brief carries a `[source #N]` tag. Writer LLM is prompted with a system instruction that uncited claims will be rejected.
-- **Citation verifier.** Programmatic check: for each claim, does the linked source actually contain that fact (LLM-as-judge sub-check)?
-- **Recency weighting.** Newer sources beat older. Time-decay function on rank.
-
-### v3: Continuous monitoring + per-rep personalization + signal triggers
-
-- **Watchlist.** Reps subscribe to account; brief auto-refreshes weekly + on signals (earnings, exec change, funding round, big hire).
-- **Per-rep personalization.** Style preferences learned from rep edits to past briefs.
-- **Trigger-based push.** "ACME just hired a new CTO who came from your prior customer X" → push notification.
-- **Per-tenant isolation.** Strict per-tenant data isolation since briefs may leak competitive intel.
-
-### Cost math
-
-500 reps × 30 briefs/week × 50 weeks = 750K briefs/year.
-
-- **Web search API (Brave / SerpAPI):** ~$0.002/query, ~10 queries/brief → 7.5M queries × $0.002 = **$15K/year**.
-- **Paid data APIs (Crunchbase, ZoomInfo):** seat-based, ~$50K/year for 500 reps.
-- **LLM cost (multi-source agent, ~15K tokens in / 2K out, gpt-4o-mini for planner + writer, gpt-4o for tricky reduce):** ~$0.04/brief × 750K = **$30K/year**.
-- **Hosting + integrations:** ~$30K/year.
-- **Total ~$125K/year ≈ $250/rep/year.** ROI: if each rep closes one extra deal/year from better prep, payback is immediate.
-
-### Latency math
-
-Async target: 60 seconds from request to delivered brief.
-
-| Phase | Time |
-|---|---|
-| Plan | 1-2s |
-| Parallel source fetch | 5-15s |
-| Rank + dedupe | 2-5s |
-| Write + verify | 10-20s |
-| Format + push | 1-2s |
-| **Total** | **~30-45s** |
-
-### Eval strategy
-
-- **Citation precision.** % of citations that actually support the claim. LLM-as-judge sample.
-- **Freshness.** % of sources < 30 days old.
-- **Factuality on numbers.** Spot-check financial figures vs. EDGAR / earnings releases.
-- **Rep edit-rate.** % of briefs reps edit before using (low edit = high quality).
-- **Outcome lift.** A/B test: reps using briefs vs. control on win rate. 1-2 quarter measurement.
-
-### Curveball Q&A for Case 7
-
-**Q: How do you handle scraping legality / TOS?**
-
-A: Three principles. (1) Prefer official APIs over scraping. (2) Use commercial search APIs (Brave, Serper, Tavily) that handle the scraping legally. (3) Respect robots.txt and rate limits. For sites that ban scraping (LinkedIn famously), use their official API (Sales Navigator) or paid data partners. Never scrape competitors' sites directly.
-
-**Q: What if the brief gets a fact wrong and the rep cites it on a call?**
-
-A: Two defenses. (1) Visible citations + hyperlinks — the rep can verify in 10 seconds. (2) Confidence labels on each claim ("High confidence: from SEC filing" vs. "Reported: from news, unverified"). Reps trust calibrated systems more than confident ones; calibration is the integrity move.
-
-**Q: How would you measure "did this help close more deals"?**
-
-A: Hardest question in sales tech. (1) Pre/post deployment win-rate by rep cohort. (2) A/B by territory if possible. (3) Rep-self-report instrument ("did this brief give you a useful talking point?"). (4) Time-saved metric (reps freed from manual research). I'd never claim causality from win-rate alone — confounders are everywhere — but the panel of metrics tells a credible story.
-
-**Q: What's the privacy concern with this system?**
-
-A: Search-side data leakage — a competitor watching paid-search APIs could infer your sales targets from query patterns. Mitigation: use proxy / aggregated search where possible; use APIs that don't leak referrer; document this risk for security review. Also: never include rep names in API calls.
-
-**Q: How do you keep this from becoming a stalking tool?**
-
-A: Bounded scope: company-level facts, public-domain personal facts (LinkedIn role, publicly stated quotes). No personal data harvesting (no home addresses, family info, etc.). Audit trail of every individual queried; legal review of personal-data flows. Sales enablement, not OSINT.
+### Numbers to drop
+- Hybrid retrieve top-50: ~80ms
+- Cross-encoder rerank 50 pairs: ~100ms (Cohere Rerank API ~200ms with network)
+- Precision@5 lift: 0.35–0.45 (raw hybrid) → 0.75–0.85 (with rerank), typical
+- Cost: rerank adds ~$0.001/query (Cohere) or near-zero (self-hosted bge-reranker)
 
 ---
 
-## Case Study 8: Compliance / Regulatory Q&A System
+## Drill 9: Your RAG Hallucinates in Prod — Diagnose and Fix
 
-### The scenario
+> "QA reports the RAG bot is making things up. Two examples: it cited a section number that doesn't exist, and it gave a confident answer about a policy we don't have. How do you debug and fix?"
 
-> "Design a Q&A system for a 10K-person financial services company. Compliance officers and front-line bankers ask questions about regulations, internal policies, and audit findings. Wrong answers create regulatory risk. Every answer must cite specific clauses."
+**Fundamentals tested:** F16 (Evaluation), F7 (RAG), guardrails
 
-### Why this is a distinct archetype
+### Clarify in 30 seconds
+1. **Retrieval failure or generation failure?** — Did the right chunk come back and the LLM ignored it? Or did the wrong chunk come back? Different root cause.
+2. **Cite-vs-make-up split?** — If the LLM cites fake section numbers, generation is the problem. If it cites nothing, retrieval probably failed.
+3. **How was this caught?** — User complaint? Eval set? Determines whether you have a labeled regression test ready.
 
-**Citation isn't optional — it's the product.** No-answer beats wrong-answer. The system has to express uncertainty. Multi-jurisdiction (federal, state, EU). Source authority matters (a regulation outranks an internal memo).
+### Mental model
 
-### Step 1: Clarifying questions
+Hallucination has two root causes:
+- **Retrieval miss**: right answer wasn't in the chunks → LLM fills the gap from training data.
+- **Generation drift**: right chunks present, LLM still synthesizes beyond them.
 
-- **Source taxonomy?** Regulations, internal policies, audit findings, prior Q&A pairs — each has different authority and update cadence.
-- **Jurisdictional scope?** US fed only, or also state, EU, APAC?
-- **Audit trail requirement?** Every Q&A pair logged for X years.
-- **User trust model?** Are users lawyers (high prior knowledge) or front-line bankers (lower)?
-- **Acceptable answer when uncertain?** Refuse, defer to human, or hedge?
+The fix differs. Your debug flow must distinguish them. Then add guardrails so it can't reach the user even when it happens.
 
-### v1: Vanilla RAG with citations
-
-(Same shape as Case 1, with an enforced "no citation, no answer" rule.)
-
-### v1 failure modes
-
-1. **Outdated regulations.** Sources weeks stale; answers reference superseded rules.
-2. **Multi-jurisdiction confusion.** Federal vs. state rule cited for the wrong context.
-3. **Authority weighting wrong.** Internal memo cited as if it's a regulation.
-4. **Hallucinated citation IDs.** "See 17 CFR § 240.10b-5" but the rule cited doesn't address the question.
-5. **Overconfidence on edge cases.** Model expresses certainty on a genuinely ambiguous regulation.
-
-### v2: Authority-weighted retrieval + clause-grain index + abstention
+### Architecture sketch — Hallucination defense stack
 
 ```mermaid
-flowchart TB
-    Q[Question] --> Jurisdiction[Jurisdiction Detector<br/>infer from user profile + question]
-    Jurisdiction --> Filter[Source filter<br/>tenant + jurisdiction + active-only]
-
-    Filter --> Search[Hybrid Search]
-    subgraph Indexes[Per-source indexes]
-        Reg[(Regulations<br/>clause-level chunks)]
-        Pol[(Policies<br/>section-level)]
-        Audit[(Audit findings)]
-        Hist[(Prior Q&A pairs)]
-    end
-    Search --> Reg
-    Search --> Pol
-    Search --> Audit
-    Search --> Hist
-
-    Search --> Score[Score with authority weighting<br/>reg > policy > memo > prior Q&A]
-    Score --> Rerank[Cross-encoder rerank]
-    Rerank --> Conf{Top-1 score<br/>>= threshold?}
-
-    Conf -->|no| Abstain[Return:<br/>'I could not find a confident answer.<br/>Possibly relevant: [low-conf links].<br/>Recommend asking compliance counsel.']
-    Conf -->|yes| Writer[Writer LLM<br/>strict citation mode]
-    Writer --> CitVer[Citation Verifier<br/>each claim → cited clause must support it]
-    CitVer -->|fail| Abstain
-    CitVer -->|pass| Answer[Answer + cited clauses]
-
-    Answer --> Audit2[(Audit log<br/>question, answer, sources, user, ts)]
+flowchart TD
+  Q[Query] --> R[Retrieval]
+  R --> P{Top-k contains<br/>answer?}
+  P -->|no| AB[Abstain:<br/>'I don't have info on that']
+  P -->|yes| G[Generate w/ strict prompt:<br/>only use provided context]
+  G --> F[Faithfulness check<br/>LLM-as-judge]
+  F -->|grounded| OUT[Answer + citations]
+  F -->|not grounded| REGEN[One regen with stricter prompt]
+  REGEN -->|still fails| AB
 ```
 
-**Key design moves:**
-- **Clause-grain chunks.** Regulations are chunked at the sub-section / clause level so citations are precise. "17 CFR § 240.10b-5(a)" — not the whole section.
-- **Authority weights.** Each source carries a weight: regulation = 1.0, policy = 0.7, memo = 0.5, prior Q&A = 0.4. Retrieval score is `relevance × authority`.
-- **Jurisdiction filter.** Inferred from user profile + question. Federal-only banker doesn't get EU MiFID II answers.
-- **Abstention threshold.** If top retrieved score < threshold, refuse to answer + show low-confidence links.
-- **Strict citation enforcement.** Writer generates only with verbatim quotes + IDs. Verifier confirms quote matches source. Mismatch → abstain.
-- **Audit log.** Every Q&A persisted with full trace. Required for regulator review.
+### Three decisions you must defend
 
-### v3: Multi-jurisdiction + version tracking + escalation routing
+1. **Make abstention cheap and explicit.** System prompt: "If the provided context does not directly answer the question, respond with exactly: 'I don't have information on that in the knowledge base.' Do not infer, do not guess, do not use general knowledge." A *good* answer rate of 80% + 20% abstain is better than 95% answer rate with 15% hallucinated.
 
-- **Regulation versioning.** Track effective dates; user asking about Q2 2024 trade gets the Q2 2024 version of the rule, not current. Time-travel queries.
-- **Cross-jurisdiction conflict surfacing.** When fed and state rules differ, explicitly flag. "Federal Reg X says A; California rule Y says B; in CA, the stricter applies."
-- **Escalation routing.** When abstaining or low-confidence: route to specific compliance officer based on jurisdiction + topic. Not just "ask compliance" — *which* compliance person.
-- **Continuous regulatory ingest.** Daily ingest of Federal Register, state regulator updates, internal policy changes. Index refreshes within 24 hours of publication.
+2. **Faithfulness check as a post-generation gate.** A second LLM call: "Given context = [chunks], answer = [generated], for each claim in the answer, is it supported by the context? Output JSON {claim, supported: bool, chunk_id}." If any claim is unsupported, regenerate once with a stricter prompt, then fall through to abstain. This is RAGAS-style faithfulness in production.
 
-### Cost math
+3. **Citation-locked output.** Force the LLM to output `{answer: ..., citations: [{chunk_id, span}]}`. Reject responses where citations don't exist in the retrieved set. Reject section numbers in `answer` that don't appear in the retrieved text. Cheap regex check, catches the "fake Section 4.2(b)" failure mode.
 
-10K employees × 5 questions/week × 50 weeks = 2.5M queries/year.
+### Likely curveballs
 
-- **LLM (gpt-4o for high-stakes, ~3K in / 800 out / query):** $0.025/query × 2.5M = **$60K/year**.
-- **Retrieval / index:** ~$20K/year (small corpus, < 10M chunks).
-- **Regulatory data feeds:** $30-100K/year (Westlaw, Bloomberg Law).
-- **Hosting + ops + audit log retention:** $30K/year.
-- **Total ~$150-220K/year**, ~$20/eng/year. Tiny vs. one regulatory fine.
+- **Q: Faithfulness check adds another LLM call — too expensive?** A: Use a cheap model (Haiku/Mini) for the judge. ~$0.0005/query overhead. Sample 100% in early prod, drop to 10% sample + log all flagged after launch.
+- **Q: How do you eval this offline?** A: Build a "no-answer" golden set: questions you *know* the corpus can't answer. Measure abstention rate. Should be >95%. Then build a "right-answer" set with ground-truth citations. Measure citation-accuracy. Target >90%.
+- **Q: User says "I know it's there, why won't it answer?"** A: That's a *retrieval* problem now, not hallucination. Debug: does the relevant chunk exist in the index? Does it come back for the query? If yes and yes, the LLM was overly conservative — relax the abstention prompt slightly.
 
-### Latency math
-
-Interactive: < 5 seconds for confident answers; abstention can be faster.
-
-| Phase | Time |
-|---|---|
-| Jurisdiction detect | < 100 ms |
-| Hybrid retrieval | 200-400 ms |
-| Rerank | 300 ms |
-| Writer + citation verify | 1.5-3 s |
-| **Total** | **~3-4s** |
-
-### Eval strategy
-
-- **Citation precision.** Every cited clause must actually support the claim. Manual audit + LLM judge. Target 99%+.
-- **Refusal calibration.** When the system refuses, is it justified? Spot-check refusals against expert ground truth.
-- **Outdated-source detection.** Test set with deprecated regulations — does the system correctly avoid them?
-- **Multi-jurisdiction tests.** Same question, different jurisdiction tags, different correct answers.
-- **Regression: regulatory updates.** When a regulation changes, do answers update within 24 hours?
-
-### Curveball Q&A for Case 8
-
-**Q: What if a user asks something the system doesn't know — do you ever guess?**
-
-A: Never. The product *requires* abstention as a first-class outcome. Better to refuse 30% of queries than confidently answer 5% wrong on regulatory questions. The abstention message routes the user to a human compliance officer. We measure "useful refusals" (where the human follow-up was the right call) vs. "blame refusals" (where the system *should* have known).
-
-**Q: How do you keep the regulatory corpus fresh?**
-
-A: Three streams. (1) Automated ingest from Federal Register, SEC, FINRA, state regulator feeds — daily diff and re-embed. (2) Internal policy updates flow via PR-style review by compliance team. (3) Quarterly audit of "stale" sources (last-updated > 12 months). Effective dates are tracked at the clause level.
-
-**Q: An auditor asks: 'show me every answer the system gave about Reg W in the past 18 months.' Can you?**
-
-A: Yes — that's the audit log structure. Indexed by (regulation tag, time window). Output: CSV of question, answer, cited clauses, user, timestamp, ID. Plus a sign-off attestation that the answer was system-generated and confidence-gated.
-
-**Q: How do you handle conflicting regulations across jurisdictions?**
-
-A: Detect the conflict explicitly. The answer surfaces both rules with a stricter-applies note. Never silently choose one. Compliance officers want to know about conflicts; presenting them is the value.
-
-**Q: What's the worst-case scenario, and how does the system prevent it?**
-
-A: Worst case: a confident wrong answer leads a banker to make a non-compliant trade → regulatory enforcement → fine + reputational damage. Prevention: (1) strict citation requirement, (2) authority weighting prevents memo-as-regulation errors, (3) abstention default for low-confidence, (4) audit log for traceability. The system is designed to fail safely — abstention is fine, wrong answer is catastrophic.
+### Numbers to drop
+- Faithfulness pass rate target: >90% (claims supported by retrieved context)
+- Abstention rate on out-of-corpus questions: >95%
+- Latency overhead from faithfulness check: ~600ms (cheap judge model)
+- Cost overhead: ~$0.0005/query
 
 ---
 
-## Case Study 9: Clinical Note Drafting Assistant (HIPAA)
+## Drill 10: Your Agent Hits 50 Tool Calls and Bills $20 — Stop It
 
-### The scenario
+> "An agent for IT ticket triage went rogue last night — it called the same `get_user_directory` tool 50 times in a loop and racked up $20 in tokens before someone killed it. Design the stop conditions."
 
-> "Design a tool that drafts clinical notes from doctor-patient conversations for a 200-clinic primary-care network. Doctor wears a mic; after the visit, a structured SOAP note appears in the EHR for the doctor to review and sign."
+**Fundamentals tested:** F9 (Agents), F10 (Tools), cost guardrails
 
-### Why this is a distinct archetype
+### Clarify in 30 seconds
+1. **Loop type?** — Same tool, same args (true infinite)? A-B-A oscillation? State-hash repeating? Each is detected differently.
+2. **What's the legit max tool calls?** — Most workflows are <8. If yours genuinely needs 30, the design is wrong; decompose the task.
+3. **Real-time or async?** — Real-time agent needs fast trip; async batch can afford richer post-mortem.
 
-HIPAA / regulated, life-safety adjacent, doctor-in-loop required, deep EHR integration, accuracy bar very high, structured output (SOAP format), medical terminology.
+### Mental model
 
-### Step 1: Clarifying questions
+Agents loop because (a) the LLM keeps re-issuing the same plan, (b) tool results are noisy and the LLM "tries again", or (c) the stop condition isn't checked. Defense is **layered**: cheap fast checks first, expensive smart checks last. You want to kill the loop in <3 wasted calls.
 
-- **EHR system?** Epic, Cerner, Athenahealth — all have different integration paths.
-- **In-person or telehealth?** Audio capture differs.
-- **Specialty?** Primary care vs. cardiology vs. mental health — vocabulary and note conventions differ dramatically.
-- **Compliance posture?** BAA-eligible providers only. On-prem option needed?
-- **Doctor adoption model?** Mandatory or opt-in?
-
-### v1: STT + LLM → SOAP note draft
+### Architecture sketch — Stop-condition stack
 
 ```mermaid
-flowchart LR
-    Visit[Visit ends] --> Audio[Encrypted audio capture]
-    Audio --> STT[Medical STT - Nuance / Whisper-Med]
-    STT --> Trans[(De-identified transcript)]
-    Trans --> LLM[Medical LLM<br/>BAA-covered]
-    LLM --> Draft[SOAP draft]
-    Draft --> EHR[Doctor reviews + signs in EHR]
+flowchart TD
+  L[Agent step] --> C1{Max steps?<br/>default 10}
+  C1 -->|yes| STOP1[Stop: max steps]
+  C1 -->|no| C2{Same tool+args<br/>3× in a row?}
+  C2 -->|yes| STOP2[Stop: repeat detected]
+  C2 -->|no| C3{Token budget<br/>exceeded?}
+  C3 -->|yes| STOP3[Stop: budget cap]
+  C3 -->|no| C4{State hash<br/>seen before?}
+  C4 -->|yes| STOP4[Stop: no progress]
+  C4 -->|no| C5{Wall clock<br/>>30s?}
+  C5 -->|yes| STOP5[Stop: timeout]
+  C5 -->|no| EXEC[Execute tool]
+  EXEC --> L
 ```
 
-### v1 failure modes
+### Three decisions you must defend
 
-1. **Drug name errors.** "Metoprolol" mistranscribed as "metropolitan." Catastrophic if it goes to the script.
-2. **Allergy / contraindication errors.** Wrong fact in PMH → wrong subsequent decision.
-3. **PHI leak in non-BAA model.** Using a provider without BAA → violation.
-4. **Missing nuance.** Doctor said "rule out X" → note says "diagnosed with X."
-5. **Doctor over-trust.** Doctor signs without reviewing because workflow optimizes for speed.
-6. **Hallucinated history.** Note mentions "smokes 1 pack a day" — patient didn't say that.
+1. **Multiple stop conditions, cheapest first.** Order: (1) max steps (hard cap, default 10); (2) same-tool-same-args repeat (hash `(tool_name, sorted_args)`, fail at 3 repeats); (3) token budget cap per query ($0.50 default); (4) state-hash no-progress (hash `(conversation_state)` after each step, fail if seen before); (5) wall-clock timeout (30s real-time, 5min async). Each is O(1) to check. None depend on the LLM's self-awareness.
 
-### v2: Medical-domain models + dual extraction + nudged review
+2. **Budget caps per query AND per session AND per tenant.** Token budget per query = $0.50. Per session = $5. Per tenant per day = $100. Hierarchical caps mean a single bad query can't blow up, and a single bad day can't blow up the business. Surface budget consumed in the agent's context so a smart LLM can self-throttle.
 
-```mermaid
-flowchart TB
-    Visit[Visit ends] --> AudioE[Audio encrypted]
-    AudioE --> STT[Medical STT<br/>WER < 5% on med terms]
+3. **Idempotency on side-effect tools.** Read tools (search, lookup) can be called freely. Write tools (create_ticket, send_email, charge_card) require an `idempotency_key` and the executor enforces "if same key, return cached result, don't re-execute". Why: the LLM looping on a write tool is what turns $20 into $20K plus 50 duplicate emails to your CEO.
 
-    STT --> Diariz[Diarization<br/>doctor vs patient]
-    Diariz --> Redact[Auto-redact sensitive<br/>that shouldn't be in note]
+### Likely curveballs
 
-    Redact --> Dual[Dual extraction]
-    Dual --> Extract1[LLM extractor<br/>structured: SOAP sections]
-    Dual --> Extract2[Med-NER<br/>meds, doses, conditions, allergies]
+- **Q: Won't max steps = 10 cut off legitimate long tasks?** A: Yes for some. The fix is task decomposition: break the long task into a multi-turn workflow with checkpoints, not one mega-agent with 50 steps. If you genuinely need >10 steps in one turn, you probably want a planner-executor split or a separate background job.
+- **Q: How do you detect A-B-A-B oscillation specifically?** A: Maintain a sliding window of the last N tool calls. If `len(set(last_4)) == 2` and you've seen this pattern before, it's oscillation. Practically: many agents oscillate between "search → think → search differently → think" — that's fine. You're looking for `search(X) → search(X) → search(X)` type patterns.
+- **Q: What about cost spikes from prompt size, not loops?** A: Different problem — usually conversation history blowup. Solution: summarize old turns into a rolling summary after every 10 turns, drop verbose tool outputs after they've been consumed.
 
-    Extract1 --> Cross[Cross-check]
-    Extract2 --> Cross
-    Cross --> Conflict{Conflicts?}
-    Conflict -->|yes| Flag[Flag conflicts in draft]
-    Conflict -->|no| Draft[SOAP draft]
-    Flag --> Draft
-
-    Draft --> Verify[Safety verifier<br/>drug name spell + dose sanity]
-    Verify --> EHRDraft[Push to EHR as DRAFT<br/>requires explicit sign]
-
-    EHRDraft --> Doctor[Doctor reviews]
-    Doctor --> Sign[Sign & finalize]
-    Doctor -.-> Correct[Corrections logged]
-    Correct --> Train[(Training data, weekly review)]
-
-    subgraph Compliance
-        Audit[(HIPAA audit log)]
-        BAA[All vendors BAA]
-        Encrypt[E2E encryption]
-    end
-```
-
-**Key design moves:**
-- **Medical STT.** Use a medical-trained ASR (Nuance Dragon Medical One, Whisper-MedLM). General Whisper isn't enough for drug names.
-- **Diarization + speaker filtering.** Only doctor's diagnostic statements go into the assessment; only patient's reported symptoms go into HPI.
-- **Dual extraction with cross-check.** Run a structured LLM extractor *and* a medical NER (e.g., scispaCy or AWS Comprehend Medical). Disagreements get flagged in the draft for doctor attention.
-- **Drug safety verifier.** RxNorm lookup on every drug; dose range check against standard formulary. Hallucinated drug → reject.
-- **Draft-only, never auto-finalize.** Doctor must explicitly sign. The "review" step is mandated, not opportunistic.
-- **Correction feedback loop.** Doctor edits trained into the next fine-tune.
-
-### v3: Per-specialty fine-tunes + structured EHR write-back + clinical decision flagging
-
-- **Per-specialty models.** Cardiology and dermatology have different note conventions. Per-specialty LoRA adapters.
-- **Structured EHR write-back.** Not just narrative — write structured fields (vitals, diagnoses with ICD-10, medications with RxNorm IDs). Reduces double-entry.
-- **Clinical-decision flagging (advisory, not prescriptive).** "You mentioned chest pain in a 55yo male; consider ECG per protocol X." Always advisory, never overriding doctor judgment. Liability surface managed carefully.
-
-### Cost math
-
-200 clinics × 20 doctors/clinic × 25 visits/day × 250 days = 25M visits/year.
-
-- **STT (medical-grade):** $0.10/visit × 25M = **$2.5M/year**. (Self-host with Whisper-MedLM saves significantly — ~$1M with GPU pool.)
-- **LLM (BAA-covered, ~5K in / 1K out, mid-tier model):** ~$0.05/visit × 25M = **$1.25M/year**.
-- **Compliance overhead (encryption, audit log retention, BAA contracts):** ~$200K/year.
-- **Total: ~$3-4M/year for 25M visits = $0.14/visit.** Compare: doctor time spent on notes is ~15 min/visit × $300/hr = $75/visit. Even if the system saves only 5 min/visit, ROI is enormous.
-
-### Latency math
-
-Doctor-perceived: draft must be ready by the time the doctor opens the patient chart after the visit. Target: < 2 minutes.
-
-| Phase | Time |
-|---|---|
-| STT (15-min visit) | 30-60s |
-| Diarize + redact | 10s |
-| Dual extract | 20-30s |
-| Cross-check + verify | 10-15s |
-| EHR write | 5-10s |
-| **Total** | **~90-120s** |
-
-### Eval strategy
-
-- **Drug-name accuracy.** Per-drug exact-match on a labeled set. Target 99%+.
-- **Dose safety.** % of dose values within plausible range.
-- **SOAP completeness.** Each section populated where applicable.
-- **Doctor edit-rate.** Time-series; falling rate = improving.
-- **Critical-omission rate.** Did the note miss a fact the doctor said? Spot-checked weekly.
-- **Hallucination rate.** Did the note add a fact the doctor didn't say? Spot-checked weekly.
-
-### Curveball Q&A for Case 9
-
-**Q: What's the regulatory model for an AI that drafts but doesn't sign clinical notes?**
-
-A: In the US, this is "documentation assistance" — not a medical device, no FDA approval required as long as the doctor remains the decision-maker who signs. If the system *makes diagnostic recommendations*, it crosses into clinical decision support and may need 510(k) clearance depending on risk class. Our design stays squarely on the documentation side. Any decision-support features are advisory + flagged + opt-in.
-
-**Q: What if the system mishears 'metoprolol' as 'methadone'?**
-
-A: Defense in depth. (1) Medical STT trained on med vocab (low base rate). (2) RxNorm verifier post-STT — methadone in a primary-care setting flags as unusual. (3) Per-patient PMH cross-check (was patient on methadone before?). (4) The doctor signs and is the final check. Probability of all four failing on the same note approaches negligible.
-
-**Q: How do you handle malpractice liability?**
-
-A: Vendor contracts include indemnification for system errors that fall within model limitations (with carve-outs for misuse). Plus: error patterns are tracked publicly to the doctor community so the system is "known" to fail in certain ways. Plus: doctor-must-sign workflow means legal responsibility stays with the doctor. The system's role is documented as "scribe assist," matching the conventional human-scribe liability model.
-
-**Q: What's the worst type of error?**
-
-A: Hallucinated allergy/medication. A note that says "patient denies penicillin allergy" when patient said the opposite → catastrophic downstream prescribing error. We treat this as critical: dedicated allergy NER, cross-check against existing PMH, flag any change to allergy list for doctor confirmation. Allergy changes never auto-write to structured EHR — always require explicit doctor toggle.
-
-**Q: How do you onboard a new specialty?**
-
-A: Three-phase: (1) shadow mode — system generates notes alongside human-scribe for 4 weeks; compare offline. (2) Pilot — 5 doctors opt in, weekly review of edits. (3) Roll out with specialty LoRA adapter trained on phase-2 corrections. New specialty takes 2-3 months end-to-end.
+### Numbers to drop
+- Default max steps: 10
+- Default per-query budget: $0.50
+- Repeat-detection threshold: 3 identical (tool, args) tuples
+- Wall-clock timeout: 30s real-time, 5min async
+- Cost of stop-condition checks: <1ms per step (all O(1) hash lookups)
 
 ---
-
-## Case Study 10: Workflow Automation Agent (Enterprise RPA Replacement)
-
-### The scenario
-
-> "Design an agent that automates business processes for a 5K-employee enterprise. Today, this is done with brittle UI-driven RPA bots (UiPath / Automation Anywhere). Replace it with an LLM-driven agent that uses APIs where possible, falls back to UI automation, and gracefully escalates."
-
-### Why this is a distinct archetype
-
-This is **the Distyl wheelhouse**. Long-running. Tool-rich. Multi-system. Stateful. Failure-tolerant by design. Often has a human handoff path. Heavy on observability and audit.
-
-### Step 1: Clarifying questions
-
-- **Process complexity?** Single-app (move data from email to ticket system) vs. multi-app workflow (intake → ERP → fulfillment → customer comm).
-- **Latency tolerance?** Real-time or batch (overnight)?
-- **Existing API coverage?** What % of systems have good APIs vs. require UI automation?
-- **Compliance / audit?** Likely high in finance/healthcare. Drives logging and approval gates.
-- **Failure model.** Idempotency, retries, rollback?
-
-### v1: Single-task agent with tool calls
-
-```mermaid
-flowchart LR
-    Trigger[Trigger:<br/>email/event/schedule] --> Agent[Agent LLM]
-    Agent --> Tools[Tool registry]
-    Tools --> API1[ERP API]
-    Tools --> API2[Email API]
-    Tools --> API3[Slack API]
-    Tools --> UI[UI Automation<br/>Playwright fallback]
-    Agent --> Result[Done]
-```
-
-### v1 failure modes
-
-1. **Brittle UI automation.** Selector breaks on page redesign.
-2. **No idempotency.** Retry creates duplicate orders.
-3. **Long-running tasks die.** Process spans 20 minutes; LLM session times out at 5.
-4. **No checkpointing.** Crash at step 8 means restart from step 1.
-5. **Unclear escalation.** When the agent fails, what does the human get?
-6. **Audit gaps.** Compliance asks "who placed this $50K order" — answer is "the agent" which isn't satisfying.
-
-### v2: Plan + checkpointed execution + UI/API fallback ladder + structured escalation
-
-```mermaid
-flowchart TB
-    Trigger[Trigger] --> Planner[Planner LLM<br/>decompose to steps]
-    Planner --> Plan[(Plan: ordered steps<br/>with checkpoints)]
-
-    Plan --> Exec[Executor]
-    Exec --> Pick{Tool layer<br/>API > SDK > UI}
-    Pick -->|API exists| API[API call]
-    Pick -->|API failed or missing| UI[UI Automation<br/>Playwright + vision LLM]
-    Pick -->|UI ambiguous| Esc[Escalate to human]
-
-    API --> Checkpoint[Checkpoint state]
-    UI --> Checkpoint
-    Checkpoint --> Storage[(Workflow state DB)]
-    Checkpoint --> Next[Next step]
-    Next --> Exec
-
-    subgraph Guards
-        Loop[Loop detector]
-        Budget[Token + time budget]
-        Idem[Idempotency keys]
-    end
-
-    Exec -.-> Guards
-
-    subgraph Recovery
-        Replay[Resume from last checkpoint]
-        Rollback[Compensating transactions]
-        EscalQ[Human queue with full context]
-    end
-
-    Exec --> Recovery
-    Esc --> EscalQ
-
-    subgraph Audit
-        Trace[Every tool call logged]
-        Approval[Approval gates for $-amount thresholds]
-        SignOff[Human sign-off for state-changing ops]
-    end
-
-    Exec -.-> Audit
-```
-
-**Key design moves:**
-- **Plan-then-execute, with checkpoints.** The planner produces an ordered, idempotent step list at the start. Each step's success state is persisted. Crash recovery resumes from last checkpoint.
-- **Tool fallback ladder.** Prefer API. If API fails or doesn't exist, use the SDK if available. If neither, fall back to vision-LLM-driven UI automation (Playwright + screenshot). Never start with UI.
-- **Idempotency keys.** Every state-changing call carries a key derived from (workflow_id, step_id). Re-run safe.
-- **Compensating transactions.** Long workflows define rollback steps. Mid-flow failure → execute compensations for already-completed mutations.
-- **Approval gates by threshold.** Spend > $X, headcount changes, anything regulated → mandatory human approval inline. Approval becomes a step in the plan, not an afterthought.
-- **Structured escalation context.** When escalating: ship the human a full trace (steps done, current state, what's blocking, suggested action). Not "agent failed."
-
-### v3: Multi-workflow concurrency + per-tenant tool ACL + drift detection
-
-- **Concurrency model.** Workflow state lives in a durable workflow engine (Temporal, AWS Step Functions, or custom on Postgres). Agent is invoked per step; engine handles retries / timeouts / fanout.
-- **Per-tenant tool ACL.** Tenant A's agent can call Tenant A's ERP only. Per-tool, per-tenant credentials in vault. Audit logs are tenant-scoped.
-- **Drift detection on UI automation.** When UI selectors fail more than X% in a week, alert + queue for re-bind. Maintain a registry of "active UI bindings" with last-success-timestamp.
-- **Process discovery.** Optionally observe humans doing workflows; suggest automations. Goes beyond replace-current-RPA to find-new-automations.
-
-### Cost math
-
-5K employees × ~50 workflows/eng/year (highly variable) ≈ 250K workflow executions/year. (Distribution skewed — top 10 workflows = 80% of volume.)
-
-- **LLM cost per workflow:** wildly variable. Simple: 10 LLM calls × $0.01 = $0.10. Complex: 100+ calls × $0.05 = $5+.
-- **Average: ~$1/workflow → $250K/year LLM cost.**
-- **Workflow engine + infra:** $50K/year (Temporal Cloud or self-host).
-- **UI automation pool (browser fleet):** $50K/year.
-- **Total: ~$350K/year**, ≈ $70/eng/year.
-- **Comparison:** RPA vendors (UiPath, Automation Anywhere) charge $4-12K per bot per year, and a company this size runs 50-200 bots → $200K-2.4M/yr. This system replaces them while being more flexible.
-
-### Latency math
-
-Long-running. Per-step latency matters, end-to-end is what it is.
-
-- Simple workflow (3 API steps): 5-15 seconds.
-- Mid workflow (10 steps, mix API + UI): 1-5 minutes.
-- Complex (50 steps, approvals): hours to days.
-
-### Eval strategy
-
-- **Per-workflow success rate.** Did the workflow complete without escalation? Baseline by workflow type.
-- **Escalation precision.** When the agent escalates, was the human action consistent with what the agent suggested?
-- **Time saved per workflow.** Compare to historical human time.
-- **Compliance audit pass rate.** Random sampled workflows pass an audit checklist.
-- **UI selector freshness.** % of UI bindings stale > 30 days.
-
-### Curveball Q&A for Case 10
-
-**Q: How is this different from existing RPA platforms?**
-
-A: Three differences. (1) **LLM-driven decisions** — the agent handles novel cases (a new email template, a slightly different invoice format) without re-coding. RPA breaks the moment selectors change. (2) **API-first** — the agent prefers APIs, leaving UI automation as fallback rather than primary, which is more stable and faster. (3) **Natural-language extensibility** — adding a new workflow is "describe it" rather than weeks of bot development.
-
-**Q: What about regulatory / SOX-controlled workflows?**
-
-A: Approval gates and audit logs are first-class. For SOX-relevant workflows (financial close, expense approval): every state-changing step requires a logged approval, with the approver's identity and timestamp persisted. The agent can prepare but never finalize without explicit human action. Auditors get a single trace per workflow with cryptographic chain-of-custody.
-
-**Q: What happens when an upstream system has an outage mid-workflow?**
-
-A: The workflow engine handles retries with exponential backoff. After max retries, the workflow pauses (not fails) and queues a notification. When the system recovers, the workflow resumes from last checkpoint. For non-idempotent steps with partial state, compensating transactions roll back to a clean state first.
-
-**Q: How do you avoid the agent doing something stupid like deleting a database?**
-
-A: Three layers. (1) **Tool ACL** — destructive tools aren't in the registry unless the workflow needs them. (2) **Per-tool approval thresholds** — `delete_records` with > 100 rows requires human approval inline. (3) **Dry-run mode** — every state-changing call has a dry-run variant; agent must run dry-run first and gate on success. Same pattern as my take-home, scaled up.
-
-**Q: When is RPA still the right answer?**
-
-A: When the workflow is fully stable, the systems don't have APIs, and the cost of LLM calls exceeds the cost of RPA bot maintenance. Highly repetitive, deterministic, never-changes workflows on legacy desktop apps where Playwright + vision-LLM is overkill. We'd keep them on RPA and migrate as the surrounding systems modernize.
-
----
-
 ## Cross-Cutting Concepts Reference
 
 Quick-reference appendix for terms and patterns you might need.
