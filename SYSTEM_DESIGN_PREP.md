@@ -1,9 +1,5 @@
-# Distyl AI System Design — Interview Prep
 
-> Self-contained prep document for the 45-minute AI System Design case study round.
-> Designed for offline study. No external references needed.
 
----
 
 ## How to use this document
 
