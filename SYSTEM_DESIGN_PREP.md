@@ -9,7 +9,7 @@ This doc has three components:
 2. **Three deep case studies** — each one walks v1 → v2 → v3 with full architecture, failure modes, cost/latency math, evals, and likely follow-up Q&A. Each is designed to take 30–45 minutes to read and absorb.
 3. **Cross-cutting reference** — vocabulary, patterns, and curveball Q&A bank.
 
-The three case studies are chosen because they cover the archetypes Distyl is most likely to ask:
+The three case studies are chosen because they cover the archetypes most likely to be asked:
 
 - **Case 1: Enterprise Document Q&A (RAG)** — foundational AI systems pattern. If you only know one, know this.
 - **Case 2: Enterprise Support Agent** — Distyl's bread and butter. Tool use, multi-tenant, agent loops.
