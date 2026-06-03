@@ -244,7 +244,6 @@ If you want a simple starting stack without overthinking it:
 - OpenAI GPT-5 nano: [developers.openai.com/api/docs/models/gpt-5-nano](https://developers.openai.com/api/docs/models/gpt-5-nano)
 - OpenAI embeddings guide: [platform.openai.com/docs/guides/embeddings](https://platform.openai.com/docs/guides/embeddings)
 - Cohere Embed: [docs.cohere.com/docs/cohere-embed](https://docs.cohere.com/docs/cohere-embed)
-- Cohere Rerank: [docs.cohere.com/docs/rerank](https://docs.cohere.com/docs/rerank)
 - Google Gemini 2.5 Flash: [cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-flash](https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-flash)
 - Google Gemini 2.5 Flash-Lite: [cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-flash-lite](https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-flash-lite)
 - Google Gemini 2.5 Pro: [cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-pro](https://cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/2-5-pro)
