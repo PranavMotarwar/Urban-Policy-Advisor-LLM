@@ -2078,6 +2078,16 @@ Apply your take-home's three-layer guardrail pattern, plus voice-specific additi
 - Pattern match on dates, dollar amounts, medical/legal terms in the assistant's output.
 - If detected without a corresponding tool call, flag and suppress.
 
+  Design and build robust connectors across SQL / NoSQL databases, APIs (REST / GraphQL), SaaS platforms (e.g., CRM, storage systems)
+Interpret and model heterogeneous source schemas
+Transform raw source data into formats optimized for AI inference
+Work closely with ML, applied AI and forward deployed teams to define feature expectations
+Collaborate with infrastructure teams to design and ship hosted data pipelines
+Optimize for latency, consistency, and edge constraints
+Design resilient ingestion patterns for unreliable or rate-limited systems
+Build logging, monitoring and debuggability into all integrations
+
+
 **Conversation state machine (structured flow):**
 - Most outbound calls follow a script: greet → identify → state purpose → handle question → confirm → close.
 - Encode as a state machine. LLM is used for natural language at each step, not for "what step are we on."
