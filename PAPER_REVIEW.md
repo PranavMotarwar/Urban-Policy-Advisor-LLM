@@ -1,6 +1,6 @@
 # Review: *Survey on Large Language Models and GPU*
 
-**Reviewer pass:** full read of `ieee_project_report.tex` (2,034 lines), citation-integrity check, image/reference cross-check, and a compile attempt.
+**Reviewer pass:** full read of `ieee_project_report.tex` (2,034 lines), citation -integrity check, image/reference cross-check, and a compile attempt.
 **Verdict:** Strong, ambitious survey with a clear thesis and genuinely good sections — but **not submittable as-is**. There are hard build blockers, broken references, and several structural/flow problems that need a revision pass first.
 
 ---
