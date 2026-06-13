@@ -5,7 +5,7 @@
 
 This doc has three components:
 
-1. **The Universal Framework** — the 6-step structure you'll run for any question. Practice this until it's reflex.
+1. **The Universal Framework** — the 6-step structure you'll run for any question.
 2. **Three deep case studies** — each one walks v1 → v2 → v3 with full architecture, failure modes, cost/latency math, evals, and likely follow-up Q&A. Each is designed to take 30–45 minutes to read and absorb.
 3. **Cross-cutting reference** — vocabulary, patterns, and curveball Q&A bank.
 
