@@ -12,7 +12,7 @@ This doc has three components:
 The three case studies are chosen because they cover the archetypes most likely to be asked:
 
 - **Case 1: Enterprise Document Q&A (RAG)** — foundational AI systems pattern. If you only know one, know this.
-- **Case 2: Enterprise Support Agent** — Distyl's bread and butter. Tool use, multi-tenant, agent loops.
+- **Case 2: Enterprise Support Agent** Tool use, multi-tenant, agent loops.
 - **Case 3: Voice Agent for Call Center** — plays to your take-home expertise. Real-time constraints, guardrails.
 
 The case studies progressively reference your take-home work. Lean into that experience explicitly during the interview — it's a strong signal.
